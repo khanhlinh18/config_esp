@@ -759,6 +759,18 @@ void taskMQTTPublish(void *pvParameters) {
 
           char infoPayload[300];
           serializeJson(infoDoc, infoPayload);
+
+          if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+              if (mqtt.publish(TOPIC_INFO, infoPayload)) {
+                  Serial.printf("[MQTT] Info Updated -> RSSI: %d\n", current_rssi);
+                  last_ip = current_ip;
+                  last_wifi = current_wifi;
+                  last_rssi = current_rssi;
+                  last_info_send = millis();
+              }
+              xSemaphoreGive(mqttMutex);
+          }
+      }
           
           if (mqtt.publish(TOPIC_INFO, infoPayload)) {
               Serial.printf("[MQTT] Info Updated -> RSSI: %d\n", current_rssi);
