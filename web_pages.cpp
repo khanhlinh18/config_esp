@@ -1,5 +1,4 @@
 #include "web_config.h"
-#include "web_dashboard.h"
 
 const char* htmlForm = R"rawliteral(
 <!DOCTYPE html><html><head>
