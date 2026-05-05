@@ -656,8 +656,7 @@ void connectMQTT() {
   }
 }
 // ================== NETWORK TASKS ==================
-void taskNetwork(void *pvParameters)
-{
+void taskNetwork(void *pvParameters){
 	unsigned long wifi_start_time = millis();
 	unsigned long last_wifi_recheck = millis();
 	unsigned long last_mqtt_retry = 0;
@@ -667,6 +666,10 @@ void taskNetwork(void *pvParameters)
 
 	while (1)
 	{
+    if (setup_mode) { 
+            vTaskDelay(pdMS_TO_TICKS(1000)); 
+            continue; 
+        }
 		bool current_wifi_ok = (WiFi.status() == WL_CONNECTED);
 
 		if (current_wifi_ok)
@@ -1051,7 +1054,7 @@ void taskMQTTPublish(void *pvParameters) {
       }
 
       // 3. GỬI DATA MODBUS (Chỉ xử lý khi mqtt_ok)
-      if (mqtt_ok && totalGroups > 0 && (millis() - last_data_send > DATA_INTERVAL)) {
+      /*if (mqtt_ok && totalGroups > 0 && (millis() - last_data_send > DATA_INTERVAL)) {
         static char payload[4096];
         int offset = snprintf(payload, sizeof(payload), "{\"data\":[");
 
@@ -1086,7 +1089,44 @@ void taskMQTTPublish(void *pvParameters) {
           last_data_send = millis();
           xSemaphoreGive(mqttMutex);
         }
-      }
+      }*/
+      if (mqtt_ok && totalGroups > 0 && (millis() - last_data_send > DATA_INTERVAL)) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+        for (int i = 0; i < totalGroups; i++) {
+        char slaveTopic[100];
+        char payload[1024]; 
+
+        snprintf(slaveTopic, sizeof(slaveTopic), "factory/device01/slave%d", myGroups[i].id);
+
+        int offset = 0;
+        if (myGroups[i].isLost) {
+            snprintf(payload, sizeof(payload), "{\"id%d\":\"val\":\"ERR\"}", myGroups[i].id);
+        } else {
+            offset = snprintf(payload, sizeof(payload), "{\"id%d\":[", myGroups[i].id);
+            for (int j = 0; j < myGroups[i].regCount; j++) {
+                if (j > 0) offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
+                
+                int regAddr = myGroups[i].startReg + (myGroups[i].dataType == 2 ? j * 2 : j);
+                offset += snprintf(payload + offset, sizeof(payload) - offset, 
+                                   "{\"reg%d\":%.1f}", regAddr, myGroups[i].lastData[j]);
+            }
+            snprintf(payload + offset, sizeof(payload) - offset, "]}");
+        }
+
+        if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+            if (mqtt.publish(slaveTopic, payload)) {
+                Serial.printf("[MQTT] Published: %s\n", slaveTopic);
+            } else {
+                Serial.printf("[MQTT] Publish FAILED to: %s\n", slaveTopic);
+            }
+            xSemaphoreGive(mqttMutex);
+        }
+          vTaskDelay(pdMS_TO_TICKS(150)); 
+    }
+    last_data_send = millis();
+    xSemaphoreGive(dataMutex); 
+  }
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
