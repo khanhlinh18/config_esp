@@ -1,5 +1,4 @@
 #define TINY_GSM_MODEM_SIM7600
-// #include <Arduino.h>
 #include <esp_task_wdt.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -25,16 +24,10 @@
 #define RELAY_ALARM 12
 #define SETUP_BUTTON 0
 #define LED_AP 13
-
 // ================== SYSTEM LIMITS ==================
 #define MAX_SLAVES 15
 #define MAX_REGS_PER_SLAVE 5
 #define ERR_LEN 16
-
-// const char* ntpServer = "pool.ntp.org";
-// const long  gmtOffset_sec = 7 * 3600;
-// const int   daylightOffset_sec = 0;
-
 // ================== OBJECTS ==================
 TinyGsm modem(SerialAT);
 TinyGsmClient gsmClient(modem);
@@ -145,8 +138,7 @@ void updateConfigFromJSON(const char *jsonStr)
 {
 	JsonDocument doc;
 	DeserializationError error = deserializeJson(doc, jsonStr);
-	if (error)
-		return;
+	if (error) return;
 
 	JsonArray slaves = doc["slaves"].as<JsonArray>();
 
@@ -204,9 +196,7 @@ void loadConfig()
 	{
 		Serial.println("[SYSTEM] Tìm thấy cấu hình Slaves, đang khôi phục...");
 		updateConfigFromJSON(savedSlavesJSON.c_str());
-	}
-	else
-	{
+	} else {
 		Serial.println("[SYSTEM] Chưa có cấu hình Slaves trong Flash.");
 	}
 }
@@ -352,7 +342,6 @@ void setupAPIEndpoints()
     JsonDocument doc;
     doc["mac"] = WiFi.macAddress();
     
-    // FIX: Tách biệt logic lấy thông tin, tuyệt đối KHÔNG gọi  ở đây
     if (WiFi.status() == WL_CONNECTED) {
         doc["ip"] = WiFi.localIP().toString();
         doc["wifi"] = WiFi.SSID();
@@ -360,7 +349,7 @@ void setupAPIEndpoints()
     } else {
         doc["ip"] = global_gsm_ip;
         doc["wifi"] = "4G/GSM";
-        doc["rssi"] = global_rssi; // Lấy từ biến lưu trữ toàn cục
+        doc["rssi"] = global_rssi; 
     }
     doc["sim_ccid"] = global_sim_ccid;
     
@@ -618,21 +607,9 @@ bool connectGSM()
 		return false;
 	if (!modem.isGprsConnected())
 		return false;
-
-	// int year, month, day, hour, minute, second;
-	// float timezone;
-	// if (modem.getNetworkTime(&year, &month, &day, &hour, &minute, &second, &timezone)) {
-	//   struct tm t;
-	//   t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day;
-	//   t.tm_hour = hour; t.tm_min = minute; t.tm_sec = second;
-	//   time_t now = mktime(&t);
-	//   struct timeval tv = { .tv_sec = now };
-	//   settimeofday(&tv, NULL);
-	//   Serial.println("[TIME] Đã đồng bộ giờ từ SIM");
-	// }
-	Serial.println("[NET] GSM Connected!");
-	return true;
-}
+	  Serial.println("[NET] GSM Connected!");
+	  return true;
+  }
 
 void connectMQTT() {
   Serial.printf("[MQTT] Đang thử kết nối Server: %s:%d...\n", conf_mqtt_server.c_str(), conf_mqtt_port);
@@ -642,7 +619,6 @@ void connectMQTT() {
   String clientId = "ESP32_" + WiFi.macAddress();
   clientId.replace(":", "");
 
-  // KHÓA MUTEX TRONG SUỐT QUÁ TRÌNH KẾT NỐI (Bảo vệ tuyệt đối SIM7600)
   if (xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     bool success = mqtt.connect(clientId.c_str());
     
@@ -763,7 +739,6 @@ void taskNetwork(void *pvParameters){
         xSemaphoreGive(mqttMutex);
       }
 			if (!mqtt_ok){
-				// Nếu last_mqtt_retry = 0, điều kiện này sẽ luôn đúng
 				if (millis() - last_mqtt_retry > 10000 || last_mqtt_retry == 0){
           connectMQTT();
 					last_mqtt_retry = millis();
@@ -847,139 +822,6 @@ void taskModbus(void *pvParameters)
 	}
 }
 
-/*void taskMQTTPublish(void *pvParameters){
-	static String last_ip = "";
-	static String last_wifi = "";
-	static String last_ccid = "";
-	static int last_rssi = 0;
-	static unsigned long last_data_send = 0;
-	static unsigned long last_info_send = 0;
-
-	const uint32_t DATA_INTERVAL = 30000;
-	const uint32_t FORCE_SEND_INTERVAL = 15 * 60 * 1000;
-
-	while (1){
-		if (!setup_mode && mqtt.connected())
-		{
-			String current_ip = "0.0.0.0";
-			String current_wifi = "Disconnected";
-			int current_rssi = -113;
-			bool has_info_changed = false;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    current_ip = WiFi.localIP().toString();
-    current_wifi = WiFi.SSID();
-    current_rssi = WiFi.RSSI();
-  } else if (gsm_ok) {
-    current_wifi = "4G/GSM";
-    if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      static unsigned long last_sim_check = 0;
-      if (millis() - last_sim_check > 15000) {
-        if (!is_modem_sleeping) {
-          int rssi_raw = modem.getSignalQuality();
-          global_rssi = (rssi_raw != 99) ? (2 * rssi_raw) - 113 : -113;
-          global_gsm_ip = modem.localIP().toString();
-        }
-          last_sim_check = millis();
-        }
-          xSemaphoreGive(mqttMutex); // Nhả Mutex ngay lập tức
-    }
-        
-    // Lấy dữ liệu từ biến đệm ra để xuất MQTT Info
-    current_rssi = global_rssi;
-    current_ip = global_gsm_ip;
-  }
-
-			if (current_ip != last_ip || current_wifi != last_wifi || abs(current_rssi - last_rssi) >= 5)
-			{
-				has_info_changed = true;
-			}
-			if (millis() - last_info_send > FORCE_SEND_INTERVAL)
-				has_info_changed = true;
-
-			if (has_info_changed)
-			{
-				JsonDocument infoDoc;
-				infoDoc["mac"] = WiFi.macAddress();
-				infoDoc["ip"] = current_ip;
-				infoDoc["wifi"] = current_wifi;
-				infoDoc["rssi"] = current_rssi;
-				infoDoc["ccid"] = global_sim_ccid;
-
-				char infoPayload[300];
-				serializeJson(infoDoc, infoPayload);
-
-				if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE)
-				{
-					if (mqtt.publish(TOPIC_INFO, infoPayload))
-					{
-						Serial.printf("[MQTT] Info Updated -> RSSI: %d\n", current_rssi);
-						last_ip = current_ip;
-						last_wifi = current_wifi;
-						last_rssi = current_rssi;
-						last_info_send = millis();
-					}
-					xSemaphoreGive(mqttMutex);
-				}
-			}
-		}
-
-		if (!setup_mode && mqtt.connected() && totalGroups > 0 && (millis() - last_data_send > DATA_INTERVAL))
-		{
-			static char payload[4096];
-			int offset = snprintf(payload, sizeof(payload), "{\"data\":[");
-
-			xSemaphoreTake(dataMutex, portMAX_DELAY);
-			bool first = true;
-			for (int i = 0; i < totalGroups; i++)
-			{
-				if (!first)
-					offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
-
-				if (myGroups[i].isLost)
-				{
-					offset += snprintf(payload + offset, sizeof(payload) - offset,
-									   "{\"id\":%d,\"val\":\"NONE\"}", myGroups[i].id);
-				}
-				else
-				{
-					offset += snprintf(payload + offset, sizeof(payload) - offset, "{\"id\":%d,\"data\":[", myGroups[i].id);
-
-					for (int j = 0; j < myGroups[i].regCount; j++)
-					{
-						if (j > 0)
-							offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
-
-						int regAddr = myGroups[i].startReg + (myGroups[i].dataType == 2 ? j * 2 : j);
-						offset += snprintf(payload + offset, sizeof(payload) - offset,
-										   "{\"reg\":%d,\"val\":%.1f}", regAddr, myGroups[i].lastData[j]);
-					}
-					offset += snprintf(payload + offset, sizeof(payload) - offset, "]}");
-				}
-				first = false;
-			}
-			xSemaphoreGive(dataMutex);
-
-			snprintf(payload + offset, sizeof(payload) - offset, "]}");
-
-			if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE)
-			{
-				if (mqtt.publish(TOPIC_DATA, payload))
-				{
-					Serial.println("[MQTT] Modbus Data Sent");
-				}
-				else
-				{
-					Serial.println("[MQTT] Modbus Data FAILED to send");
-				}
-				last_data_send = millis(); // Cập nhật để tránh spam liên tục
-				xSemaphoreGive(mqttMutex);
-			}
-		}
-		vTaskDelay(pdMS_TO_TICKS(1000));
-	}
-}*/
-
 void taskMQTTPublish(void *pvParameters) {
   static String last_ip = "";
   static String last_wifi = "";
@@ -1054,42 +896,6 @@ void taskMQTTPublish(void *pvParameters) {
       }
 
       // 3. GỬI DATA MODBUS (Chỉ xử lý khi mqtt_ok)
-      /*if (mqtt_ok && totalGroups > 0 && (millis() - last_data_send > DATA_INTERVAL)) {
-        static char payload[4096];
-        int offset = snprintf(payload, sizeof(payload), "{\"data\":[");
-
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        bool first = true;
-        for (int i = 0; i < totalGroups; i++) {
-          if (!first) offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
-          
-          if (myGroups[i].isLost) {
-            offset += snprintf(payload + offset, sizeof(payload) - offset, "{\"id\":%d,\"val\":\"NONE\"}", myGroups[i].id);
-          } else {
-            offset += snprintf(payload + offset, sizeof(payload) - offset, "{\"id\":%d,\"data\":[", myGroups[i].id);
-            for (int j = 0; j < myGroups[i].regCount; j++) {
-              if (j > 0) offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
-              int regAddr = myGroups[i].startReg + (myGroups[i].dataType == 2 ? j * 2 : j);
-              offset += snprintf(payload + offset, sizeof(payload) - offset, "{\"reg\":%d,\"val\":%.1f}", regAddr, myGroups[i].lastData[j]);
-            }
-            offset += snprintf(payload + offset, sizeof(payload) - offset, "]}");
-          }
-          first = false;
-        }
-        xSemaphoreGive(dataMutex);
-
-        snprintf(payload + offset, sizeof(payload) - offset, "]}");
-
-        if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-          if (mqtt.publish(TOPIC_DATA, payload)) {
-            Serial.println("[MQTT] Modbus Data Sent");
-          } else {
-            Serial.println("[MQTT] Modbus Data FAILED to send");
-          }
-          last_data_send = millis();
-          xSemaphoreGive(mqttMutex);
-        }
-      }*/
       if (mqtt_ok && totalGroups > 0 && (millis() - last_data_send > DATA_INTERVAL)) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
 
@@ -1222,8 +1028,6 @@ void setup()
 	mqtt.setBufferSize(4096);
 	mqtt.setKeepAlive(120);
 	mqtt.setSocketTimeout(30);
-
-	// configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
 	getStaticSimInfo();
 	loadConfig();
