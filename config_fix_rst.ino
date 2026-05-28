@@ -11,6 +11,7 @@
 
 #include "web_config.h"
 #include "web_dashboard.h"
+#include "web_login.h"
 // ================== PINS & HARDWARE ==================
 #define SerialAT Serial2
 #define MODEM_RX 27
@@ -21,13 +22,11 @@
 #define MODBUS_SERIAL Serial1
 #define RXD2 17
 #define TXD2 16
-#define RELAY_ALARM 12
+#define RELAY_ALARM 12   // Relay kích loa khi nhận alarm từ cloud
 #define SETUP_BUTTON 0
 #define LED_AP 13
 // ================== SYSTEM LIMITS ==================
 #define MAX_SLAVES 15
-#define MAX_REGS_PER_SLAVE 5
-#define ERR_LEN 16
 // ================== OBJECTS ==================
 TinyGsm modem(SerialAT);
 TinyGsmClient gsmClient(modem);
@@ -55,26 +54,50 @@ bool network_ok = false;
 bool mqtt_ok = false;
 
 const char *www_user = "admin";
-const char *www_pass = "cuctac";
+const char *MASTER_PIN = "12345"; // PIN bí mật để reset mật khẩu
+String www_pass_str = "cuctac";   // Mật khẩu động, load từ NVS
 
-volatile bool alarm_sensor = false;
-volatile bool alarm_network = false;
-volatile bool alarm_mqtt = false;
+// ================== SESSION TOKEN ==================
+#define SESSION_TIMEOUT_MS  (30UL * 60UL * 1000UL)  // 30 phút
+String  session_token   = "";
+uint32_t session_expiry = 0;
 
-const char *TOPIC_DATA = "factory/device01/data";
-const char *TOPIC_CONFIG = "factory/device01/config";
-const char *TOPIC_ALARM = "factory/device01/alarm";
-const char *TOPIC_INFO = "factory/device01/info";
+String generateToken() {
+    String t = "";
+    for (int i = 0; i < 32; i++) {
+        t += String((uint8_t)esp_random(), HEX);
+    }
+    return t;
+}
+
+bool isValidSession() {
+    if (session_token == "") return false;
+    if (!server.hasHeader("Cookie")) return false;
+    String cookie = server.header("Cookie");
+    if (cookie.indexOf("token=" + session_token) < 0) return false;
+    if (millis() > session_expiry) { session_token = ""; return false; }
+    session_expiry = millis() + SESSION_TIMEOUT_MS;
+    return true;
+}
+
+void redirectToLogin() {
+    server.sendHeader("Location", "/login");
+    server.send(302, "text/plain", "");
+}
+
+void redirectToDashboard() {
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+}
+
+volatile bool alarm_cloud = false; // Cờ nhận alarm từ cloud
+
+const char *TOPIC_DATA   = "factory/device10/data";
+const char *TOPIC_CONFIG = "factory/device10/config";
+const char *TOPIC_ALARM  = "factory/device10/alarm"; // Subscribe để nhận lệnh từ cloud
+const char *TOPIC_INFO   = "factory/device10/info";
 
 // ================== MODBUS STRUCT  ==================
-
-struct RegConfig
-{
-	uint8_t type;
-	float minVal;
-	float maxVal;
-	char err[ERR_LEN];
-};
 
 struct SlaveGroup
 {
@@ -83,42 +106,37 @@ struct SlaveGroup
 	uint8_t count;
 	uint8_t dataType;
 	float div;
-	uint8_t regCount;
-	RegConfig regs[MAX_REGS_PER_SLAVE];
-	float lastData[MAX_REGS_PER_SLAVE];
-	bool alarmState[MAX_REGS_PER_SLAVE];
+	float lastData[MAX_SLAVES];
 	bool isLost;
 };
 
 SlaveGroup myGroups[MAX_SLAVES];
 uint8_t totalGroups = 0;
 
-bool setup_mode = false;
+volatile bool setup_mode = false;
 uint32_t setup_start_time = 0;
 
 SemaphoreHandle_t configMutex;
 SemaphoreHandle_t dataMutex;
-SemaphoreHandle_t alarmMutex;
 SemaphoreHandle_t mqttMutex;
 
 // ================== RS485 ==================
 void preTransmission() { digitalWrite(MAX485_DE, 1); }
 void postTransmission() { digitalWrite(MAX485_DE, 0); }
 
-// ================== ALARM BUZZER ==================
-void taskBuzzer(void *pvParameters)
+// ================== ALARM FROM CLOUD ==================
+// Cloud phụ trách so sánh ngưỡng, ESP chỉ nhận lệnh và kích loa
+void taskAlarm(void *pvParameters)
 {
+	bool lastAlarm = false;
 	while (1)
 	{
-		bool sensor, net, mqtt_err;
+		if (alarm_cloud != lastAlarm)
+		{
+			lastAlarm = alarm_cloud;
+		}
 
-		xSemaphoreTake(alarmMutex, portMAX_DELAY);
-		sensor = alarm_sensor;
-		net = alarm_network;
-		mqtt_err = alarm_mqtt;
-		xSemaphoreGive(alarmMutex);
-
-		if (sensor || net || mqtt_err)
+		if (alarm_cloud)
 		{
 			digitalWrite(RELAY_ALARM, LOW);
 			vTaskDelay(pdMS_TO_TICKS(1000));
@@ -151,25 +169,14 @@ void updateConfigFromJSON(const char *jsonStr)
 		for (int i = 0; i < totalGroups; i++)
 		{
 			JsonObject s = slaves[i];
-			myGroups[i].id = s["id"] | 1;
-			myGroups[i].startReg = s["start"] | 0;
-			myGroups[i].count = s["count"] | 0;
-			myGroups[i].dataType = s["dataType"] | 1;
-			myGroups[i].div = s["div"] | 10.0;
+			myGroups[i].id        = s["id"]       | 1;
+			myGroups[i].startReg  = s["start"]     | 0;
+			myGroups[i].count     = s["count"]     | 0;
+			myGroups[i].dataType  = s["dataType"]  | 1;
+			myGroups[i].div       = s["div"]       | 10.0;
 
-			JsonArray regs = s["regs"].as<JsonArray>();
-			int rSize = regs.size();
-			myGroups[i].regCount = (rSize > MAX_REGS_PER_SLAVE) ? MAX_REGS_PER_SLAVE : rSize;
-
-			for (int j = 0; j < myGroups[i].regCount; j++)
-			{
-				JsonObject r = regs[j];
-				myGroups[i].regs[j].type = r["type"] | 0;
-				myGroups[i].regs[j].minVal = r["min"] | 0.0;
-				myGroups[i].regs[j].maxVal = r["max"] | 100.0;
-				strlcpy(myGroups[i].regs[j].err, r["err"] | "ERR", ERR_LEN);
+			for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++)
 				myGroups[i].lastData[j] = -9999.0;
-			}
 		}
 		xSemaphoreGive(configMutex);
 
@@ -186,6 +193,7 @@ void loadConfig()
 	conf_pass = prefs.getString("pass", "");
 	conf_mqtt_server = prefs.getString("mqtt_srv", "broker.emqx.io");
 	conf_mqtt_port = prefs.getInt("mqtt_port", 1883);
+	www_pass_str = prefs.getString("www_pass", "cuctac"); // Load mật khẩu web
 	prefs.end();
 
 	prefs.begin("modbus_cfg", false);
@@ -201,144 +209,14 @@ void loadConfig()
 	}
 }
 
-// ================== ALARM TASK ==================
-void taskAlarm(void *pvParameters)
-{
-	unsigned long last_send_time = 0;
-	const uint32_t ALARM_INTERVAL = 5000;
-	bool last_anySensorAlarm = false;
-
-	while (1)
-	{
-		bool anySensorAlarm = false;
-		char alarmList[1024] = "";
-		int offset = 0;
-
-		if (!setup_mode && totalGroups > 0)
-		{
-			xSemaphoreTake(configMutex, portMAX_DELAY);
-			xSemaphoreTake(dataMutex, portMAX_DELAY);
-
-			for (int i = 0; i < totalGroups; i++)
-			{
-				uint8_t id = myGroups[i].id;
-				bool is_id_lost = false;
-				char alarmMsg[128] = "";
-
-				if (myGroups[i].isLost)
-				{
-					is_id_lost = true;
-					anySensorAlarm = true;
-					snprintf(alarmMsg, sizeof(alarmMsg), "[ID%d:LOST] ", id);
-
-					for (int j = 0; j < myGroups[i].regCount; j++)
-						myGroups[i].alarmState[j] = true;
-				}
-
-				if (!is_id_lost)
-				{
-					for (int j = 0; j < myGroups[i].regCount; j++)
-					{
-						float val = myGroups[i].lastData[j];
-						bool currentItemAlarm = false;
-						char itemMsg[64] = "";
-
-						if (myGroups[i].regs[j].type == 0)
-						{
-							if (val > myGroups[i].regs[j].maxVal)
-							{
-								currentItemAlarm = true;
-								snprintf(itemMsg, sizeof(itemMsg), "[ID%d:HI_%s] ", id, myGroups[i].regs[j].err);
-							}
-							else if (val < myGroups[i].regs[j].minVal)
-							{
-								currentItemAlarm = true;
-								snprintf(itemMsg, sizeof(itemMsg), "[ID%d:LO_%s] ", id, myGroups[i].regs[j].err);
-							}
-						}
-						else if (myGroups[i].regs[j].type == 1)
-						{
-							if (val < myGroups[i].regs[j].minVal)
-							{
-								currentItemAlarm = true;
-								snprintf(itemMsg, sizeof(itemMsg), "[ID%d:%s] ", id, myGroups[i].regs[j].err);
-							}
-						}
-
-						myGroups[i].alarmState[j] = currentItemAlarm;
-						if (currentItemAlarm)
-						{
-							anySensorAlarm = true;
-							strncat(alarmMsg, itemMsg, sizeof(alarmMsg) - strlen(alarmMsg) - 1);
-						}
-					}
-				}
-
-				if (strlen(alarmMsg) > 0 && offset + strlen(alarmMsg) < sizeof(alarmList))
-				{
-					strcat(alarmList, alarmMsg);
-					offset += strlen(alarmMsg);
-				}
-			}
-			xSemaphoreGive(configMutex);
-			xSemaphoreGive(dataMutex);
-		}
-
-		if (mqtt_ok)
-		{
-			char publishPayload[1200] = "";
-			bool shouldPublish = false;
-
-			if (anySensorAlarm != last_anySensorAlarm)
-			{
-				if (anySensorAlarm)
-				{
-					snprintf(publishPayload, sizeof(publishPayload), "START ALARM: %s", alarmList);
-				}
-				else
-				{
-					snprintf(publishPayload, sizeof(publishPayload), "NORMAL");
-				}
-				shouldPublish = true;
-			}
-			else if (millis() - last_send_time > ALARM_INTERVAL)
-			{
-				if (anySensorAlarm)
-				{
-					snprintf(publishPayload, sizeof(publishPayload), "STILL ALARM: %s", alarmList);
-				}
-				else
-				{
-					snprintf(publishPayload, sizeof(publishPayload), "NORMAL");
-				}
-				shouldPublish = true;
-			}
-
-			if (shouldPublish)
-			{
-				if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE)
-				{
-					mqtt.publish(TOPIC_ALARM, publishPayload);
-					xSemaphoreGive(mqttMutex);
-					last_send_time = millis();
-				}
-			}
-		}
-
-		last_anySensorAlarm = anySensorAlarm;
-
-		xSemaphoreTake(alarmMutex, portMAX_DELAY);
-		alarm_sensor = anySensorAlarm;
-		xSemaphoreGive(alarmMutex);
-
-		vTaskDelay(pdMS_TO_TICKS(1000));
-	}
-}
-
 void setupAPIEndpoints()
 {
+  // Khai báo header cần đọc (bắt buộc cho WebServer ESP32)
+  const char* headerKeys[] = {"Cookie"};
+  server.collectHeaders(headerKeys, 1);
+
   server.on("/api/info", HTTP_GET, []() {
-    if (!server.authenticate(www_user, www_pass)) return server.requestAuthentication();
+    if (!isValidSession()) { server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Unauthorized\"}"); return; }
     JsonDocument doc;
     doc["mac"] = WiFi.macAddress();
     
@@ -359,28 +237,18 @@ void setupAPIEndpoints()
 
 	server.on("/api/slaves", HTTP_GET, []()
 			  {
-    if (!server.authenticate(www_user, www_pass)) return server.requestAuthentication();
+    if (!isValidSession()) { server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Unauthorized\"}"); return; }
     xSemaphoreTake(configMutex, portMAX_DELAY);
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     JsonDocument doc;
     
     for (int i = 0; i < totalGroups; i++) {
         JsonObject sObj = doc["slaves"].add<JsonObject>();
-        sObj["id"] = myGroups[i].id;
-        sObj["start"] = myGroups[i].startReg;
-        sObj["count"] = myGroups[i].count;
+        sObj["id"]       = myGroups[i].id;
+        sObj["start"]    = myGroups[i].startReg;
+        sObj["count"]    = myGroups[i].count;
         sObj["dataType"] = myGroups[i].dataType;
-        sObj["div"] = myGroups[i].div;
-        
-        JsonArray regsArr = sObj["regs"].to<JsonArray>();
-        for (int j = 0; j < myGroups[i].regCount; j++) {
-            JsonObject rObj = regsArr.add<JsonObject>();
-            rObj["type"] = myGroups[i].regs[j].type;
-            rObj["min"] = myGroups[i].regs[j].minVal;
-            rObj["max"] = myGroups[i].regs[j].maxVal;
-            rObj["err"] = myGroups[i].regs[j].err;
-            // rObj["val"] = myGroups[i].lastData[j]; //  hiện data real-time
-        }
+        sObj["div"]      = myGroups[i].div;
     }
     xSemaphoreGive(configMutex);
     xSemaphoreGive(dataMutex);
@@ -389,7 +257,7 @@ void setupAPIEndpoints()
 
 	server.on("/api/save_slaves", HTTP_POST, []()
 			  {
-    if (!server.authenticate(www_user, www_pass)) return server.requestAuthentication();
+    if (!isValidSession()) { server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Unauthorized\"}"); return; }
     if (server.hasArg("plain")) {
         String body = server.arg("plain");
         updateConfigFromJSON(body.c_str()); 
@@ -398,6 +266,75 @@ void setupAPIEndpoints()
     } else {
         server.send(400, "text/plain", "Bad Request");
     } });
+
+	// ===== ĐỔI MẬT KHẨU =====
+	server.on("/api/change_pass", HTTP_POST, []() {
+		if (!isValidSession()) { server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Unauthorized\"}"); return; }
+		if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"status\":\"ERR\",\"msg\":\"Bad Request\"}"); return; }
+		JsonDocument doc;
+		deserializeJson(doc, server.arg("plain"));
+		String old_pass = doc["old_pass"] | "";
+		String new_pass = doc["new_pass"] | "";
+		if (old_pass != www_pass_str) {
+			server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Mật khẩu cũ không đúng!\"}");
+			return;
+		}
+		if (new_pass.length() < 4) {
+			server.send(400, "application/json", "{\"status\":\"ERR\",\"msg\":\"Mật khẩu mới phải có ít nhất 4 ký tự!\"}");
+			return;
+		}
+		www_pass_str = new_pass;
+		prefs.begin("net_cfg", false);
+		prefs.putString("www_pass", new_pass);
+		prefs.end();
+		server.send(200, "application/json", "{\"status\":\"OK\",\"msg\":\"Đổi mật khẩu thành công!\"}");
+	});
+
+	// ===== QUÊN MẬT KHẨU (RESET BẰNG PIN BÍ MẬT) =====
+	server.on("/api/reset_pass", HTTP_POST, []() {
+		if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"status\":\"ERR\",\"msg\":\"Bad Request\"}"); return; }
+		JsonDocument doc;
+		deserializeJson(doc, server.arg("plain"));
+		String pin = doc["pin"] | "";
+		String new_pass = doc["new_pass"] | "";
+		if (pin != String(MASTER_PIN)) {
+			server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Mã PIN không đúng!\"}");
+			return;
+		}
+		if (new_pass.length() < 4) {
+			server.send(400, "application/json", "{\"status\":\"ERR\",\"msg\":\"Mật khẩu mới phải có ít nhất 4 ký tự!\"}");
+			return;
+		}
+		www_pass_str = new_pass;
+		prefs.begin("net_cfg", false);
+		prefs.putString("www_pass", new_pass);
+		prefs.end();
+		server.send(200, "application/json", "{\"status\":\"OK\",\"msg\":\"Reset mật khẩu thành công!\"}");
+	});
+
+	// ===== LOGIN POST =====
+	server.on("/api/login", HTTP_POST, []() {
+		if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"status\":\"ERR\",\"msg\":\"Bad Request\"}"); return; }
+		JsonDocument doc;
+		deserializeJson(doc, server.arg("plain"));
+		String user = doc["user"] | "";
+		String pass = doc["pass"] | "";
+		if (user == String(www_user) && pass == www_pass_str) {
+			session_token  = generateToken();
+			session_expiry = millis() + SESSION_TIMEOUT_MS;
+			server.sendHeader("Set-Cookie", "token=" + session_token + "; Path=/; HttpOnly");
+			server.send(200, "application/json", "{\"status\":\"OK\"}");
+		} else {
+			server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Sai tên đăng nhập hoặc mật khẩu!\"}");
+		}
+	});
+
+	// ===== LOGOUT =====
+	server.on("/api/logout", HTTP_POST, []() {
+		session_token = "";
+		server.sendHeader("Set-Cookie", "token=; Path=/; Max-Age=0");
+		server.send(200, "application/json", "{\"status\":\"OK\"}");
+	});
 
 	server.on("/scan", HTTP_GET, []()
 			  {
@@ -410,7 +347,7 @@ void setupAPIEndpoints()
     json += "]";
     server.send(200, "application/json", json); });
 
-	server.on("/save", HTTP_GET, []()
+	server.on("/save", HTTP_POST, []()
 			  {
     String q_ssid = server.arg("ssid");
     String q_pass = server.arg("pass");
@@ -451,32 +388,40 @@ void taskWebServer(void *pvParameters)
 	}
 	else
 	{
-		while (WiFi.status() != WL_CONNECTED)
+		// Chờ WiFi hoặc GSM kết nối (không block mãi)
+		uint32_t wait_start = millis();
+		while (WiFi.status() != WL_CONNECTED && !gsm_ok)
 		{
+			if (millis() - wait_start > 30000) break; // Timeout 30s, mở server dù chưa có mạng
 			vTaskDelay(pdMS_TO_TICKS(1000));
 		}
-		Serial.printf("[WEB] Đang chạy chế độ Runtime (STA). IP: %s\n", WiFi.localIP().toString().c_str());
+		Serial.printf("[WEB] Đang chạy chế độ Runtime. IP: %s\n",
+			WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : global_gsm_ip.c_str());
 	}
 
-	server.on("/", HTTP_GET, []()
-			  {
-    if (setup_mode) {
-      server.send(200, "text/html", htmlForm); // AP
-    } else {
-      if (!server.authenticate(www_user, www_pass)) {
-        return server.requestAuthentication(); // STA 
-      }
-      server.send(200, "text/html", htmlDashboard); 
-    } });
+	server.on("/", HTTP_GET, []() {
+		if (setup_mode) {
+			server.send(200, "text/html", htmlForm);
+		} else {
+			if (!isValidSession()) return redirectToLogin();
+			server.send(200, "text/html", htmlDashboard);
+		}
+	});
 
-	server.onNotFound([]()
-					  {
-    if (setup_mode) {
-      server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
-      server.send(302, "text/plain", "");
-    } else {
-      server.send(404, "text/plain", "404: Not Found");
-    } });
+	server.on("/login", HTTP_GET, []() {
+		if (setup_mode) { redirectToDashboard(); return; }
+		if (isValidSession()) { redirectToDashboard(); return; }
+		server.send(200, "text/html", htmlLogin);
+	});
+
+	server.onNotFound([]() {
+		if (setup_mode) {
+			server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+			server.send(302, "text/plain", "");
+		} else {
+			redirectToLogin();
+		}
+	});
 
 	server.begin();
 
@@ -538,6 +483,15 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 		jsonStr[length] = '\0';
 		Serial.println("[MQTT] Nhận cấu hình mới!");
 		updateConfigFromJSON(jsonStr);
+	}
+	else if (strcmp(topic, TOPIC_ALARM) == 0)
+	{
+		// Cloud gửi "1" = bật loa, "0" = tắt loa
+		if (length > 0)
+		{
+			alarm_cloud = (payload[0] == '1');
+			Serial.printf("[MQTT] Alarm từ cloud: %s\n", alarm_cloud ? "BẬT" : "TẮT");
+		}
 	}
 }
 
@@ -625,6 +579,7 @@ void connectMQTT() {
     if (success) {
       Serial.println("[MQTT] Connected!");
       mqtt.subscribe(TOPIC_CONFIG);
+      mqtt.subscribe(TOPIC_ALARM);
     } else {
       Serial.printf("[MQTT] Thất bại, mã lỗi: %d\n", mqtt.state());
     }
@@ -771,7 +726,7 @@ void taskModbus(void *pvParameters)
 				uint8_t qty = myGroups[i].count;
 				uint8_t dType = myGroups[i].dataType;
 				float divisor = myGroups[i].div;
-				// uint8_t rCount = myGroups[i].regCount;
+				// uint8_t rCount = myGroups[i].count;
 				xSemaphoreGive(configMutex);
 
 				node.begin(id, MODBUS_SERIAL);
@@ -783,7 +738,7 @@ void taskModbus(void *pvParameters)
 					myGroups[i].isLost = false;
 
 					int bufferOffset = 0;
-					for (int j = 0; j < myGroups[i].regCount; j++)
+					for (int j = 0; j < myGroups[i].count; j++)
 					{
 						float rawVal = 0;
 
@@ -809,7 +764,7 @@ void taskModbus(void *pvParameters)
 				{
 					myGroups[i].isLost = true;
 
-					for (int j = 0; j < myGroups[i].regCount; j++)
+					for (int j = 0; j < myGroups[i].count; j++)
 					{
 						myGroups[i].lastData[j] = -9999.0;
 					}
@@ -903,14 +858,14 @@ void taskMQTTPublish(void *pvParameters) {
         char slaveTopic[100];
         char payload[1024]; 
 
-        snprintf(slaveTopic, sizeof(slaveTopic), "factory/device01/slave%d", myGroups[i].id);
+        snprintf(slaveTopic, sizeof(slaveTopic), "factory/device10/slave%d", myGroups[i].id);
 
         int offset = 0;
         if (myGroups[i].isLost) {
-            snprintf(payload, sizeof(payload), "{\"id%d\":\"val\":\"ERR\"}", myGroups[i].id);
+            snprintf(payload, sizeof(payload), "{\"id%d\":{\"val\":\"ERR\"}}", myGroups[i].id);
         } else {
             offset = snprintf(payload, sizeof(payload), "{\"id%d\":[", myGroups[i].id);
-            for (int j = 0; j < myGroups[i].regCount; j++) {
+            for (int j = 0; j < myGroups[i].count; j++) {
                 if (j > 0) offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
                 
                 int regAddr = myGroups[i].startReg + (myGroups[i].dataType == 2 ? j * 2 : j);
@@ -1016,9 +971,8 @@ void setup()
 	esp_task_wdt_init(60, true);
 
 	configMutex = xSemaphoreCreateMutex();
-	dataMutex = xSemaphoreCreateMutex();
-	alarmMutex = xSemaphoreCreateMutex();
-	mqttMutex = xSemaphoreCreateMutex();
+	dataMutex   = xSemaphoreCreateMutex();
+	mqttMutex   = xSemaphoreCreateMutex();
 
 	pinMode(RELAY_ALARM, OUTPUT);
 	pinMode(MAX485_DE, OUTPUT);
@@ -1051,13 +1005,12 @@ void setup()
 
 	xTaskCreatePinnedToCore(taskWatchdog, "Watchdog", 2048, NULL, 3, NULL, 0);
 	xTaskCreatePinnedToCore(taskMQTTPublish, "MQTTPub", 6144, NULL, 2, NULL, 1);
-	xTaskCreatePinnedToCore(taskWebServer, "Web", 4096, NULL, 1, NULL, 1);
+	xTaskCreatePinnedToCore(taskWebServer, "Web", 8192, NULL, 1, NULL, 1);
 	xTaskCreatePinnedToCore(taskNetwork, "Network", 8192, NULL, 3, NULL, 0);
 
 	xTaskCreatePinnedToCore(taskButton, "Button", 2048, NULL, 1, NULL, 1);
 	xTaskCreatePinnedToCore(taskModbus, "Modbus", 4096, NULL, 2, NULL, 1);
-	xTaskCreatePinnedToCore(taskAlarm, "Alarm", 4096, NULL, 3, NULL, 1);
-	xTaskCreatePinnedToCore(taskBuzzer, "Buzzer", 2048, NULL, 2, NULL, 1);
+	xTaskCreatePinnedToCore(taskAlarm, "Alarm", 2048, NULL, 2, NULL, 1);
 
 	esp_task_wdt_delete(NULL);
 	Serial.println("[SYSTEM] Setup hoàn tất.");
