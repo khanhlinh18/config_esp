@@ -157,6 +157,18 @@ const char* htmlDashboard = R"rawliteral(
         .u-id, .u-start, .u-count, .u-div { width: 70px; font-weight: bold; text-align: center; }
         .u-type { padding: 8px; }
 
+        /* Registers Table-like Grid */
+        .reg-header { 
+            display: grid; grid-template-columns: 1.5fr 1fr 1fr 2fr 50px; gap: 12px; 
+            margin-bottom: 10px; padding: 0 10px; font-weight: 700; font-size: 12px; color: var(--text-sub);
+        }
+        .reg-row { 
+            display: grid; grid-template-columns: 1.5fr 1fr 1fr 2fr 50px; gap: 12px; 
+            margin-bottom: 10px; align-items: center; background: white; padding: 8px; border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        }
+        .reg-row input, .reg-row select { width: 100%; box-sizing: border-box; }
+        
         .btn-small-del { 
             background: none; border: none; color: #cbd5e1; font-size: 18px; cursor: pointer; transition: 0.2s;
         }
@@ -260,8 +272,7 @@ const char* htmlDashboard = R"rawliteral(
         </div>
     </div>
 
-    <div class="card">
-        <h3>Modbus Slave Groups</h3>
+   
         <button class="btn btn-add" onclick="addNewSlaveGroup()">+ Add New Slave Unit</button>
         <div id="slaveGroupsContainer"></div>
         <button class="btn btn-save" onclick="saveAllConfig()">Save All Configuration</button>
@@ -304,58 +315,82 @@ function addNewSlaveGroup(data = {}) {
             </div>
             <button class="btn btn-del" onclick="this.parentElement.parentElement.remove()">Delete Unit</button>
         </div>
+        <div class="reg-header">
+            <div>Type</div><div>Min</div><div>Max</div><div>Error Message</div><div></div>
+        </div>
+        <div class="regs-list"></div>
+        <button class="btn" style="background:#e2e8f0; color:#475569; font-size:12px; margin-top:10px" onclick="addRegRow(this)">+ Add Register</button>
     `;
     container.appendChild(groupDiv);
+    
+    if (data.regs && data.regs.length > 0) {
+        data.regs.forEach(r => addRegRow(groupDiv.querySelector('button[onclick*="addRegRow"]'), r));
+    } else {
+        addRegRow(groupDiv.querySelector('button[onclick*="addRegRow"]')); 
+    }
 }
 
-function handleUnauth(r) {
-    if (r.status === 401) { window.location.href = '/login'; return null; }
-    return r.json();
+function addRegRow(btn, regData = {type: 0, min: 0, max: 100, err: "ERR"}) {
+    const list = btn.previousElementSibling;
+    const row = document.createElement('div');
+    row.className = 'reg-row';
+    row.innerHTML = `
+        <select class="r-type">
+            <option value="0" ${regData.type==0?'selected':''}>0 (Range)</option>
+            <option value="1" ${regData.type==1?'selected':''}>1 (State)</option>
+        </select>
+        <input type="number" step="any" class="r-min" value="${regData.min}">
+        <input type="number" step="any" class="r-max" value="${regData.max}">
+        <input type="text" class="r-err" value="${regData.err}">
+        <button class="btn-small-del" onclick="this.parentElement.remove()">✕</button>
+    `;
+    list.appendChild(row);
 }
 
 function loadData() {
-    fetch('/api/info')
-    .then(r => handleUnauth(r))
-    .then(data => {
-        if (!data) return;
-        document.getElementById('mac').innerText  = data.mac   || '--';
-        document.getElementById('ip').innerText   = data.ip    || '--';
-        document.getElementById('wifi').innerText = data.wifi  || '--';
-        document.getElementById('sim').innerText  = data.sim_ccid || '--';
-        document.getElementById('rssi').innerText = (data.rssi !== undefined) ? data.rssi + " dBm" : '--';
-    }).catch(e => console.log("Offline:", e));
+    fetch('/api/info').then(r => r.json()).then(data => {
+        document.getElementById('mac').innerText = data.mac;
+        document.getElementById('ip').innerText = data.ip;
+        document.getElementById('wifi').innerText = data.wifi;
+        document.getElementById('sim').innerText = data.sim_ccid;
+        document.getElementById('rssi').innerText = data.rssi + " dBm";
+    }).catch(e => console.log("Offline"));
 }
 
 function saveAllConfig() {
     let slaves = [];
     document.querySelectorAll(".slave-unit").forEach(unit => {
         let group = {
-            id:       parseInt(unit.querySelector(".u-id").value),
-            start:    parseInt(unit.querySelector(".u-start").value),
-            count:    parseInt(unit.querySelector(".u-count").value),
+            id: parseInt(unit.querySelector(".u-id").value),
+            start: parseInt(unit.querySelector(".u-start").value),
+            count: parseInt(unit.querySelector(".u-count").value),
             dataType: parseInt(unit.querySelector(".u-type").value),
-            div:      parseFloat(unit.querySelector(".u-div").value)
+            div: parseFloat(unit.querySelector(".u-div").value),
+            regs: []
         };
-        slaves.push(group);
+        unit.querySelectorAll(".reg-row").forEach(row => {
+            group.regs.push({
+                type: parseInt(row.querySelector(".r-type").value),
+                min: parseFloat(row.querySelector(".r-min").value),
+                max: parseFloat(row.querySelector(".r-max").value),
+                err: row.querySelector(".r-err").value
+            });
+        });
+        if (group.regs.length > 0) slaves.push(group);
     });
 
     fetch('/api/save_slaves', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ slaves: slaves })
-    }).then(r => handleUnauth(r))
-    .then(data => { if (data) alert("Đã lưu cấu hình!"); })
-    .catch(e => alert("Lỗi kết nối!"));
+    }).then(r => r.json()).then(data => alert("Đã lưu cấu hình!"));
 }
 
 function fetchSlaves() {
-    fetch('/api/slaves')
-    .then(r => handleUnauth(r))
-    .then(data => {
-        if (!data) return;
+    fetch('/api/slaves').then(r => r.json()).then(data => {
         document.getElementById('slaveGroupsContainer').innerHTML = "";
-        if (data.slaves) data.slaves.forEach(s => addNewSlaveGroup(s));
-    }).catch(e => console.log("fetchSlaves error:", e));
+        if(data.slaves) data.slaves.forEach(s => addNewSlaveGroup(s));
+    });
 }
 
 function showModal(id) { document.getElementById(id).classList.add('active'); }

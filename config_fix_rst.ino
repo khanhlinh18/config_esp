@@ -8,6 +8,11 @@
 #include <PubSubClient.h>
 #include <ModbusMaster.h>
 #include <DNSServer.h>
+#include <SD.h>
+#include <SPI.h>
+#include <time.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 #include "web_config.h"
 #include "web_dashboard.h"
@@ -25,6 +30,14 @@
 #define RELAY_ALARM 12   // Relay kích loa khi nhận alarm từ cloud
 #define SETUP_BUTTON 0
 #define LED_AP 13
+// ================== SD CARD (SPI) ==================
+#define SD_CS   33
+#define SD_MOSI 23
+#define SD_MISO 19
+#define SD_SCK  18
+// ================== RTC DS1307 (I2C) ==================
+#define RTC_SDA 22
+#define RTC_SCL 21
 // ================== SYSTEM LIMITS ==================
 #define MAX_SLAVES 15
 // ================== OBJECTS ==================
@@ -108,6 +121,7 @@ struct SlaveGroup
 	float div;
 	float lastData[MAX_SLAVES];
 	bool isLost;
+	bool hasBeenRead; // true sau khi đọc thành công lần đầu, tránh log LOST khi mới boot
 };
 
 SlaveGroup myGroups[MAX_SLAVES];
@@ -120,7 +134,198 @@ SemaphoreHandle_t configMutex;
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t mqttMutex;
 
-// ================== RS485 ==================
+// ================== SD LOGGER ==================
+SemaphoreHandle_t sdMutex;
+bool sd_ok      = false;
+bool ntp_synced = false;
+
+RTC_DS1307 rtc;
+bool rtc_ok     = false;
+bool rtc_synced = false;
+
+#define NTP_SERVER1      "pool.ntp.org"
+#define NTP_SERVER2      "time.google.com"
+#define GMT_OFFSET_SEC   (7 * 3600)   // UTC+7 Việt Nam
+#define DST_OFFSET_SEC   0
+
+// Lấy timestamp: ưu tiên NTP → fallback RTC → unknown
+String getTimestamp()
+{
+    struct tm t;
+    if (getLocalTime(&t))
+    {
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+        return String(buf);
+    }
+    if (rtc_ok)
+    {
+        DateTime now = rtc.now();
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                 now.year(), now.month(), now.day(),
+                 now.hour(), now.minute(), now.second());
+        return String(buf);
+    }
+    return "????-??-?? ??:??:??";
+}
+
+String getDateStr()
+{
+    struct tm t;
+    if (getLocalTime(&t))
+    {
+        char buf[12];
+        strftime(buf, sizeof(buf), "%Y-%m-%d", &t);
+        return String(buf);
+    }
+    if (rtc_ok)
+    {
+        DateTime now = rtc.now();
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+                 now.year(), now.month(), now.day());
+        return String(buf);
+    }
+    return "0000-00-00";
+}
+
+void sdLog(const char* level, const char* tag, const char* msg)
+{
+    if (!sd_ok) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+
+    String filename = "/log_" + getDateStr() + ".txt";
+    File f = SD.open(filename, FILE_APPEND);
+    if (f)
+    {
+        // Format: 2026-05-29 15:01:22 [NET] WiFi connected
+        f.printf("%s [%s] %s\n", getTimestamp().c_str(), tag, msg);
+        f.close();
+    }
+    xSemaphoreGive(sdMutex);
+}
+
+void sdLog(const char* level, const char* tag, const String& msg)
+{
+    sdLog(level, tag, msg.c_str());
+}
+
+// ================== LOG MACRO ==================
+// Dùng LOG("TAG", "format", args...) thay cho Serial.printf
+// Tự động: in ra Serial + ghi vào SD cùng lúc
+void _logPrint(const char* tag, const char* fmt, ...)
+{
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    // In Serial
+    Serial.printf("[%s] %s\n", tag, buf);
+
+    // Ghi SD (phân loại level tự động theo nội dung)
+    const char* level = "INFO";
+    String lower = String(buf);
+    lower.toLowerCase();
+    if (lower.indexOf("fail") >= 0 || lower.indexOf("lost") >= 0 ||
+        lower.indexOf("error") >= 0 || lower.indexOf("thất bại") >= 0 ||
+        lower.indexOf("disconnect") >= 0 || lower.indexOf("timeout") >= 0)
+        level = "WARN";
+
+    sdLog(level, tag, buf);
+}
+#define LOG(tag, fmt, ...) _logPrint(tag, fmt, ##__VA_ARGS__)
+
+// Đồng bộ NTP → cập nhật lại RTC
+#define LOG_MAX_DAYS 7
+
+// Xóa các file log cũ hơn LOG_MAX_DAYS ngày
+// File log có format: /log_YYYY-MM-DD.csv
+void cleanOldLogs()
+{
+    if (!sd_ok) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+
+    // Lấy ngày hiện tại từ RTC/NTP
+    DateTime today = rtc_ok ? rtc.now() : DateTime(2000, 1, 1);
+
+    File root = SD.open("/");
+    if (!root) { xSemaphoreGive(sdMutex); return; }
+
+    int deleted = 0;
+    File entry = root.openNextFile();
+    while (entry)
+    {
+        String name = String(entry.name()); // "log_YYYY-MM-DD.csv"
+        entry.close();
+
+        if (name.startsWith("log_") && name.endsWith(".txt") && name.length() == 18)
+        {
+            // Parse ngày từ tên file: log_YYYY-MM-DD.csv
+            int y = name.substring(4, 8).toInt();
+            int m = name.substring(9, 11).toInt();
+            int d = name.substring(12, 14).toInt();
+
+            if (y > 2000) // File hợp lệ
+            {
+                DateTime fileDate(y, m, d, 0, 0, 0);
+                long diffDays = ((long)today.unixtime() - (long)fileDate.unixtime()) / 86400L;
+
+                if (diffDays >= LOG_MAX_DAYS)
+                {
+                    SD.remove("/" + name);
+                    deleted++;
+                    LOG("SD", "Xóa log cũ: %s", name.c_str());
+                }
+            }
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+    xSemaphoreGive(sdMutex);
+
+    if (deleted > 0)
+    {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Deleted %d old log file(s)", deleted);
+        sdLog("INFO", "SD", buf);
+    }
+}
+
+void syncNTP()
+{
+    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
+    struct tm t;
+    int retry = 0;
+    // Tăng retry lên 20 và delay 1.5s — GSM latency cao hơn WiFi
+    while (!getLocalTime(&t) && retry < 20)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        retry++;
+    }
+    if (getLocalTime(&t))
+    {
+        ntp_synced = true;
+        if (rtc_ok && !rtc_synced)
+        {
+            rtc.adjust(DateTime(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                                t.tm_hour, t.tm_min, t.tm_sec));
+            rtc_synced = true;
+            LOG("RTC", "Synced from NTP");
+        }
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+        LOG("NTP", "Đồng bộ thành công sau %d lần thử: %s", retry + 1, buf);
+        sdLog("INFO", "NTP", String("Synced: ") + buf);
+    }
+    else
+    {
+        LOG("NTP", "Đồng bộ thất bại, giữ nguyên RTC");
+        sdLog("WARN", "NTP", "Sync failed after 20 retries, using RTC time");
+    }
+}
 void preTransmission() { digitalWrite(MAX485_DE, 1); }
 void postTransmission() { digitalWrite(MAX485_DE, 0); }
 
@@ -202,10 +407,10 @@ void loadConfig()
 
 	if (savedSlavesJSON.length() > 10)
 	{
-		Serial.println("[SYSTEM] Tìm thấy cấu hình Slaves, đang khôi phục...");
+		LOG("SYSTEM", "Tìm thấy cấu hình Slaves, đang khôi phục...");
 		updateConfigFromJSON(savedSlavesJSON.c_str());
 	} else {
-		Serial.println("[SYSTEM] Chưa có cấu hình Slaves trong Flash.");
+		LOG("SYSTEM", "Chưa có cấu hình Slaves trong Flash");
 	}
 }
 
@@ -373,7 +578,7 @@ void startAP()
 	if (WiFi.softAP("ESP_Setup", ""))
 	{
 		digitalWrite(LED_AP, LOW); // Bật LED báo hiệu
-		Serial.println("[SYSTEM] Đã bật AP và LED báo hiệu.");
+		LOG("AP", "Đã bật AP mode, chờ cấu hình WiFi...");
 	}
 	dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
 	setup_start_time = millis(); // Ghi lại thời điểm bắt đầu
@@ -384,7 +589,7 @@ void taskWebServer(void *pvParameters)
 	if (setup_mode)
 	{
 		startAP();
-		Serial.println("[WEB] Đang chạy chế độ Setup (AP)");
+		LOG("WEB", "Đang chạy chế độ Setup (AP)");
 	}
 	else
 	{
@@ -395,7 +600,7 @@ void taskWebServer(void *pvParameters)
 			if (millis() - wait_start > 30000) break; // Timeout 30s, mở server dù chưa có mạng
 			vTaskDelay(pdMS_TO_TICKS(1000));
 		}
-		Serial.printf("[WEB] Đang chạy chế độ Runtime. IP: %s\n",
+		LOG("WEB", "Đang chạy chế độ Runtime. IP: %s",
 			WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : global_gsm_ip.c_str());
 	}
 
@@ -453,7 +658,7 @@ void taskButton(void *pvParameters)
 			// Nhấn giữ hơn 5 giây
 			if (pressing && (millis() - pressTime > 5000))
 			{
-				Serial.println("\n[SYSTEM] ĐANG XÓA CẤU HÌNH VÀ REBOOT...");
+				LOG("SYSTEM", "Nút giữ 5 giây: xóa cấu hình và reboot");
 
 				prefs.begin("net_cfg", false);
 				prefs.clear(); // Xóa sạch SSID/PASS
@@ -481,7 +686,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 		static char jsonStr[4096];
 		memcpy(jsonStr, payload, length);
 		jsonStr[length] = '\0';
-		Serial.println("[MQTT] Nhận cấu hình mới!");
+		LOG("MQTT", "Nhận cấu hình mới từ cloud");
 		updateConfigFromJSON(jsonStr);
 	}
 	else if (strcmp(topic, TOPIC_ALARM) == 0)
@@ -489,8 +694,12 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 		// Cloud gửi "1" = bật loa, "0" = tắt loa
 		if (length > 0)
 		{
+			bool prev = alarm_cloud;
 			alarm_cloud = (payload[0] == '1');
-			Serial.printf("[MQTT] Alarm từ cloud: %s\n", alarm_cloud ? "BẬT" : "TẮT");
+			LOG("ALARM", "Cloud alarm: %s", alarm_cloud ? "BẬT" : "TẮT");
+			if (alarm_cloud != prev)
+				sdLog(alarm_cloud ? "WARN" : "INFO", "ALARM",
+				      alarm_cloud ? "Cloud alarm ON" : "Cloud alarm OFF");
 		}
 	}
 }
@@ -502,7 +711,7 @@ void requestWiFiConnect()
 		return;
 	last_attempt = millis();
 
-	Serial.println("[NET] Đang thử kết nối WiFi...");
+	LOG("NET", "Đang thử kết nối WiFi...");
 	WiFi.begin(conf_ssid.c_str(), conf_pass.c_str());
 }
 void resetModem()
@@ -522,7 +731,7 @@ void resetModem()
 
 bool connectGSM()
 {
-	Serial.println("=== GSM START ===");
+	LOG("NET", "=== GSM START ===");
 	resetModem();
 	modem.restart();
 
@@ -555,18 +764,18 @@ bool connectGSM()
 	else if (imsi.startsWith("45208"))
 		auto_apn = "m9-itelecom";
 
-	Serial.printf("[GSM] IMSI: %s -> Auto APN: %s\n", imsi.c_str(), auto_apn.c_str());
+	LOG("NET", "IMSI: %s -> APN: %s", imsi.c_str(), auto_apn.c_str());
 
 	if (!modem.gprsConnect(auto_apn.c_str(), "", ""))
 		return false;
 	if (!modem.isGprsConnected())
 		return false;
-	  Serial.println("[NET] GSM Connected!");
+	  LOG("NET", "GSM Connected!");
 	  return true;
   }
 
 void connectMQTT() {
-  Serial.printf("[MQTT] Đang thử kết nối Server: %s:%d...\n", conf_mqtt_server.c_str(), conf_mqtt_port);
+  LOG("MQTT", "Đang thử kết nối %s:%d...", conf_mqtt_server.c_str(), conf_mqtt_port);
   mqtt.setServer(conf_mqtt_server.c_str(), conf_mqtt_port);
   mqtt.setCallback(mqttCallback);
 
@@ -577,11 +786,11 @@ void connectMQTT() {
     bool success = mqtt.connect(clientId.c_str());
     
     if (success) {
-      Serial.println("[MQTT] Connected!");
+      LOG("MQTT", "Connected!");
       mqtt.subscribe(TOPIC_CONFIG);
       mqtt.subscribe(TOPIC_ALARM);
     } else {
-      Serial.printf("[MQTT] Thất bại, mã lỗi: %d\n", mqtt.state());
+      LOG("MQTT", "Kết nối thất bại, mã lỗi: %d", mqtt.state());
     }
     xSemaphoreGive(mqttMutex);
   }
@@ -602,21 +811,46 @@ void taskNetwork(void *pvParameters){
             continue; 
         }
 		bool current_wifi_ok = (WiFi.status() == WL_CONNECTED);
+		static bool prev_wifi_ok = false;
 
 		if (current_wifi_ok)
 		{
+			if (!prev_wifi_ok) // Vừa kết nối WiFi (kể cả lần đầu boot)
+			{
+				LOG("NET", "WiFi connected: %s IP:%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+			}
+			prev_wifi_ok = true;
 			if (!is_modem_sleeping)
 			{
-				Serial.println("[NET] Đã có WiFi, tắt SIM...");
+				LOG("NET", "Đã có WiFi, tắt SIM tiết kiệm điện");
 				modem.sendAT("+CPOWD=1");
 				is_modem_sleeping = true;
 				gsm_ok = false;
+			}
+			// Sync NTP: lần đầu hoặc mỗi 6 giờ để cập nhật RTC
+			static uint32_t last_ntp_sync = 0;
+			static uint32_t last_log_clean = 0;
+			if (!ntp_synced || millis() - last_ntp_sync > 6UL * 3600UL * 1000UL)
+			{
+				syncNTP();
+				last_ntp_sync = millis();
+			}
+			// Dọn log cũ mỗi 24 giờ
+			if (millis() - last_log_clean > 24UL * 3600UL * 1000UL || last_log_clean == 0)
+			{
+				cleanOldLogs();
+				last_log_clean = millis();
 			}
 			mqtt.setClient(wifiClient);
 			last_wifi_recheck = millis();
 		}
 		else
 		{
+			if (prev_wifi_ok) // Vừa mất WiFi
+			{
+				LOG("NET", "WiFi disconnected!");
+			}
+			prev_wifi_ok = false;
 			if (!gsm_ok || is_modem_sleeping)
 			{
 				if (millis() - wifi_start_time < WIFI_WAIT_TIME)
@@ -634,11 +868,29 @@ void taskNetwork(void *pvParameters){
 						is_modem_sleeping = false;
 						mqtt.setClient(gsmClient);
 						last_wifi_recheck = millis();
-						last_mqtt_retry = 0; // Thử MQTT ngay khi GSM vừa lên
+						last_mqtt_retry = 0;
+
+						// Chờ GPRS ổn định rồi lấy IP
+						vTaskDelay(pdMS_TO_TICKS(2000));
+						global_gsm_ip = modem.localIP().toString();
+						if (global_gsm_ip == "0.0.0.0" || global_gsm_ip == "") {
+							vTaskDelay(pdMS_TO_TICKS(3000));
+							global_gsm_ip = modem.localIP().toString();
+						}
+						LOG("NET", "GSM connected, IP: %s", global_gsm_ip.c_str());
+
+						// Sync NTP qua GSM — retry tối đa 3 lần, mỗi lần cách 5s
+						if (!ntp_synced) {
+							for (int _r = 0; _r < 3 && !ntp_synced; _r++) {
+								vTaskDelay(pdMS_TO_TICKS(5000));
+								syncNTP();
+							}
+						}
 					}
 					else
 					{
 						wifi_start_time = millis();
+						LOG("NET", "GSM connect failed, retry sau 15s");
 					}
 				}
 			}
@@ -646,10 +898,10 @@ void taskNetwork(void *pvParameters){
 			{
 				if (millis() - last_wifi_recheck > WIFI_RECHECK_INTERVAL)
 				{
-					Serial.println("[NET] Tạm dừng GSM để kiểm tra WiFi...");
+					LOG("NET", "Tạm dừng GSM, kiểm tra lại WiFi sau 10 phút");
 					if (mqtt.connected())
 					{
-						Serial.println("[NET] Tạm dừng MQTT để quét WiFi...");
+						LOG("NET", "Tạm dừng MQTT để quét WiFi");
 						mqtt.disconnect();
 					}
 					last_wifi_recheck = millis();
@@ -671,7 +923,7 @@ void taskNetwork(void *pvParameters){
 
 					if (!found_wifi)
 					{
-						Serial.println("[NET] Vẫn không có WiFi, quay lại dùng GSM.");
+						LOG("NET", "Không tìm thấy WiFi, quay lại GSM");
 						WiFi.mode(WIFI_OFF);
 						// Cần dừng Client cũ để tránh treo Socket
 						gsmClient.stop();
@@ -690,8 +942,14 @@ void taskNetwork(void *pvParameters){
 		// --- QUẢN LÝ KẾT NỐI MQTT ---
 		if (current_wifi_ok || (gsm_ok && !is_modem_sleeping)){
       if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        bool prev_mqtt_ok = mqtt_ok;
         mqtt_ok = mqtt.connected();
         xSemaphoreGive(mqttMutex);
+        // Log thay đổi trạng thái MQTT
+        if (mqtt_ok && !prev_mqtt_ok)
+            LOG("MQTT", "Connected to broker");
+        else if (!mqtt_ok && prev_mqtt_ok)
+            LOG("MQTT", "Disconnected from broker");
       }
 			if (!mqtt_ok){
 				if (millis() - last_mqtt_retry > 10000 || last_mqtt_retry == 0){
@@ -735,7 +993,12 @@ void taskModbus(void *pvParameters)
 				xSemaphoreTake(dataMutex, portMAX_DELAY);
 				if (result == node.ku8MBSuccess)
 				{
+					if (myGroups[i].isLost && myGroups[i].hasBeenRead) {
+						char _buf[40]; snprintf(_buf, sizeof(_buf), "Slave ID%d recovered", myGroups[i].id);
+						sdLog("INFO", "MODBUS", _buf);
+					}
 					myGroups[i].isLost = false;
+					myGroups[i].hasBeenRead = true;
 
 					int bufferOffset = 0;
 					for (int j = 0; j < myGroups[i].count; j++)
@@ -762,6 +1025,10 @@ void taskModbus(void *pvParameters)
 				}
 				else
 				{
+					if (!myGroups[i].isLost && myGroups[i].hasBeenRead) {
+						char _buf[40]; snprintf(_buf, sizeof(_buf), "Slave ID%d LOST", myGroups[i].id);
+						sdLog("WARN", "MODBUS", _buf);
+					}
 					myGroups[i].isLost = true;
 
 					for (int j = 0; j < myGroups[i].count; j++)
@@ -911,25 +1178,26 @@ void taskWatchdog(void *pvParameters)
 
 		if (millis() - last_connected_time > MAX_OFFLINE_MS)
 		{
-			Serial.println("[WATCHDOG] Mất kết nối quá lâu. Reboot...");
+			LOG("WATCHDOG", "Mất kết nối quá 1 giờ, reboot...");
 			vTaskDelay(pdMS_TO_TICKS(500));
 			ESP.restart();
 		}
 
 		if (millis() - system_start_time > MAINTENANCE_REBOOT)
 		{
-			Serial.println("[WATCHDOG] Reboot định kỳ...");
+			LOG("WATCHDOG", "Reboot định kỳ 7 ngày");
 			vTaskDelay(pdMS_TO_TICKS(500));
 			ESP.restart();
 		}
 		if (setup_mode && (millis() - setup_start_time > AP_TIMEOUT_MS))
 		{
-			Serial.println("[WATCHDOG] Hết thời gian Setup (3 phút). Tắt AP, chuyển qua 4G...");
+			LOG("WATCHDOG", "Hết thời gian Setup 3 phút, tắt AP chuyển 4G");
 
 			setup_mode = false;
 			WiFi.softAPdisconnect(true);
 			WiFi.mode(WIFI_STA);
 			digitalWrite(LED_AP, HIGH);
+			LOG("AP", "AP tắt, chuyển sang chế độ STA");
 		}
 		for (int i = 0; i < 30; i++)
 		{
@@ -941,7 +1209,7 @@ void taskWatchdog(void *pvParameters)
 
 void getStaticSimInfo()
 {
-	Serial.println("[SYSTEM] Khởi động SIM để lấy CCID...");
+	LOG("SYSTEM", "Khởi động SIM để lấy CCID...");
 	resetModem();
 	esp_task_wdt_reset();
 	if (modem.init())
@@ -950,16 +1218,16 @@ void getStaticSimInfo()
 		global_sim_ccid = modem.getSimCCID();
 		if (global_sim_ccid == "" || global_sim_ccid == "0")
 			global_sim_ccid = "No SIM";
-		Serial.println("[SYSTEM] CCID: " + global_sim_ccid);
+		LOG("SYSTEM", "CCID: %s", global_sim_ccid.c_str());
 
 		modem.sendAT("+CPOWD=1");
 		is_modem_sleeping = true;
-		Serial.println("[SYSTEM] Đã tắt Module SIM để hạ nhiệt.");
+		LOG("SYSTEM", "Đã tắt Module SIM để hạ nhiệt");
 	}
 	else
 	{
 		global_sim_ccid = "Modem Error";
-		Serial.println("[SYSTEM] Không thể kết nối Module SIM!");
+		LOG("SYSTEM", "Không thể kết nối Module SIM!");
 	}
 }
 
@@ -973,6 +1241,48 @@ void setup()
 	configMutex = xSemaphoreCreateMutex();
 	dataMutex   = xSemaphoreCreateMutex();
 	mqttMutex   = xSemaphoreCreateMutex();
+	sdMutex     = xSemaphoreCreateMutex();
+
+	// ===== KHỞI TẠO RTC DS1307 =====
+	Wire.begin(RTC_SDA, RTC_SCL);
+	if (rtc.begin())
+	{
+		rtc_ok = true;
+		if (!rtc.isrunning())
+		{
+			// RTC bị mất nguồn pin, đặt thời gian tạm từ lúc compile
+			rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+			LOG("RTC", "RTC mất pin, đặt thời gian compile tạm thời");
+		}
+		else
+		{
+			DateTime now = rtc.now();
+			LOG("RTC", "Thời gian: %04d-%02d-%02d %02d:%02d:%02d",
+				now.year(), now.month(), now.day(),
+				now.hour(), now.minute(), now.second());
+		}
+	}
+	else
+	{
+		rtc_ok = false;
+		LOG("RTC", "Không tìm thấy DS1307!");
+	}
+
+	// ===== KHỞI TẠO SD CARD =====
+	SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+	if (SD.begin(SD_CS))
+	{
+		sd_ok = true;
+		LOG("SD", "SD card sẵn sàng");
+		String bootMsg = String("=== ESP32 RESTARTED === RTC:") + (rtc_ok ? "OK" : "FAIL")
+		               + " SD:OK Time:" + getTimestamp();
+		sdLog("INFO", "BOOT", bootMsg);
+	}
+	else
+	{
+		sd_ok = false;
+		LOG("SD", "Không tìm thấy SD card!");
+	}
 
 	pinMode(RELAY_ALARM, OUTPUT);
 	pinMode(MAX485_DE, OUTPUT);
@@ -988,7 +1298,7 @@ void setup()
 
 	if (conf_ssid == "")
 	{
-		Serial.println("[SYSTEM] Chưa có WiFi, tự động vào chế độ Setup...");
+		LOG("SYSTEM", "Chưa có WiFi, tự động vào chế độ Setup...");
 		setup_mode = true;
 		setup_start_time = millis();
 	}
@@ -1003,7 +1313,7 @@ void setup()
 	node.preTransmission(preTransmission);
 	node.postTransmission(postTransmission);
 
-	xTaskCreatePinnedToCore(taskWatchdog, "Watchdog", 2048, NULL, 3, NULL, 0);
+	xTaskCreatePinnedToCore(taskWatchdog, "Watchdog", 4096, NULL, 3, NULL, 0);
 	xTaskCreatePinnedToCore(taskMQTTPublish, "MQTTPub", 6144, NULL, 2, NULL, 1);
 	xTaskCreatePinnedToCore(taskWebServer, "Web", 8192, NULL, 1, NULL, 1);
 	xTaskCreatePinnedToCore(taskNetwork, "Network", 8192, NULL, 3, NULL, 0);
@@ -1013,7 +1323,7 @@ void setup()
 	xTaskCreatePinnedToCore(taskAlarm, "Alarm", 2048, NULL, 2, NULL, 1);
 
 	esp_task_wdt_delete(NULL);
-	Serial.println("[SYSTEM] Setup hoàn tất.");
+	LOG("SYSTEM", "Setup hoàn tất");
 }
 
 void loop()
