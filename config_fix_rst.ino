@@ -44,7 +44,8 @@
 TinyGsm modem(SerialAT);
 TinyGsmClient gsmClient(modem);
 WiFiClient wifiClient;
-PubSubClient mqtt;
+
+PubSubClient mqtt(wifiClient);
 ModbusMaster node;
 Preferences prefs;
 WebServer server(80);
@@ -128,6 +129,7 @@ SlaveGroup myGroups[MAX_SLAVES];
 uint8_t totalGroups = 0;
 
 volatile bool setup_mode = false;
+
 uint32_t setup_start_time = 0;
 
 SemaphoreHandle_t configMutex;
@@ -199,8 +201,7 @@ void sdLog(const char* level, const char* tag, const char* msg)
     File f = SD.open(filename, FILE_APPEND);
     if (f)
     {
-        // Format: 2026-05-29 15:01:22 [NET] WiFi connected
-        f.printf("%s [%s] %s\n", getTimestamp().c_str(), tag, msg);
+        f.printf("%s [%s] [%s] %s\n", getTimestamp().c_str(), level, tag, msg);
         f.close();
     }
     xSemaphoreGive(sdMutex);
@@ -212,8 +213,6 @@ void sdLog(const char* level, const char* tag, const String& msg)
 }
 
 // ================== LOG MACRO ==================
-// Dùng LOG("TAG", "format", args...) thay cho Serial.printf
-// Tự động: in ra Serial + ghi vào SD cùng lúc
 void _logPrint(const char* tag, const char* fmt, ...)
 {
     char buf[256];
@@ -238,11 +237,8 @@ void _logPrint(const char* tag, const char* fmt, ...)
 }
 #define LOG(tag, fmt, ...) _logPrint(tag, fmt, ##__VA_ARGS__)
 
-// Đồng bộ NTP → cập nhật lại RTC
 #define LOG_MAX_DAYS 7
 
-// Xóa các file log cũ hơn LOG_MAX_DAYS ngày
-// File log có format: /log_YYYY-MM-DD.csv
 void cleanOldLogs()
 {
     if (!sd_ok) return;
@@ -258,12 +254,15 @@ void cleanOldLogs()
     File entry = root.openNextFile();
     while (entry)
     {
-        String name = String(entry.name()); // "log_YYYY-MM-DD.csv"
+      
+        String fullName = String(entry.name());
+        int slashIdx = fullName.lastIndexOf('/');
+        String name = (slashIdx >= 0) ? fullName.substring(slashIdx + 1) : fullName;
         entry.close();
 
         if (name.startsWith("log_") && name.endsWith(".txt") && name.length() == 18)
         {
-            // Parse ngày từ tên file: log_YYYY-MM-DD.csv
+            // Parse ngày từ tên file: log_YYYY-MM-DD.txt
             int y = name.substring(4, 8).toInt();
             int m = name.substring(9, 11).toInt();
             int d = name.substring(12, 14).toInt();
@@ -275,7 +274,8 @@ void cleanOldLogs()
 
                 if (diffDays >= LOG_MAX_DAYS)
                 {
-                    SD.remove("/" + name);
+                    String pathToDelete = "/" + name;
+                    SD.remove(pathToDelete);
                     deleted++;
                     LOG("SD", "Xóa log cũ: %s", name.c_str());
                 }
@@ -333,20 +333,15 @@ void postTransmission() { digitalWrite(MAX485_DE, 0); }
 // Cloud phụ trách so sánh ngưỡng, ESP chỉ nhận lệnh và kích loa
 void taskAlarm(void *pvParameters)
 {
-	bool lastAlarm = false;
 	while (1)
 	{
-		if (alarm_cloud != lastAlarm)
-		{
-			lastAlarm = alarm_cloud;
-		}
-
 		if (alarm_cloud)
 		{
 			digitalWrite(RELAY_ALARM, LOW);
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			digitalWrite(RELAY_ALARM, HIGH);
-			vTaskDelay(pdMS_TO_TICKS(1000));
+			alarm_cloud = false; // Reset sau mỗi lần kích
+			LOG("ALARM", "Relay kích xong, reset cờ alarm");
 		}
 		else
 		{
@@ -380,7 +375,9 @@ void updateConfigFromJSON(const char *jsonStr)
 			myGroups[i].dataType  = s["dataType"]  | 1;
 			myGroups[i].div       = s["div"]       | 10.0;
 
-			for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++)
+			if (myGroups[i].count > MAX_SLAVES) myGroups[i].count = MAX_SLAVES;
+
+			for (int j = 0; j < myGroups[i].count; j++)
 				myGroups[i].lastData[j] = -9999.0;
 		}
 		xSemaphoreGive(configMutex);
@@ -455,8 +452,8 @@ void setupAPIEndpoints()
         sObj["dataType"] = myGroups[i].dataType;
         sObj["div"]      = myGroups[i].div;
     }
-    xSemaphoreGive(configMutex);
     xSemaphoreGive(dataMutex);
+    xSemaphoreGive(configMutex);
     String response; serializeJson(doc, response);
     server.send(200, "application/json", response); });
 
@@ -567,7 +564,7 @@ void setupAPIEndpoints()
     prefs.end();
 
     server.send(200, "text/html", "<h2 style='text-align:center; font-family:sans-serif; margin-top:50px;'>SAVED!<br>Gateway is restarting...</h2>");
-    delay(2000);
+    vTaskDelay(pdMS_TO_TICKS(2000));
     ESP.restart(); });
 }
 // ================== WEB TASKS ==================
@@ -581,7 +578,6 @@ void startAP()
 		LOG("AP", "Đã bật AP mode, chờ cấu hình WiFi...");
 	}
 	dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-	setup_start_time = millis(); // Ghi lại thời điểm bắt đầu
 }
 void taskWebServer(void *pvParameters)
 {
@@ -645,6 +641,7 @@ void taskButton(void *pvParameters)
 	pinMode(SETUP_BUTTON, INPUT_PULLUP);
 	uint32_t pressTime = 0;
 	bool pressing = false;
+	bool resetTriggered = false; // Cờ chống kích hoạt nhiều lần
 
 	while (1)
 	{
@@ -654,17 +651,21 @@ void taskButton(void *pvParameters)
 			{
 				pressTime = millis();
 				pressing = true;
+				resetTriggered = false;
 			}
-			// Nhấn giữ hơn 5 giây
-			if (pressing && (millis() - pressTime > 5000))
+			// Nhấn giữ hơn 5 giây — chỉ xử lý 1 lần (resetTriggered)
+			if (pressing && !resetTriggered && (millis() - pressTime > 5000))
 			{
-				LOG("SYSTEM", "Nút giữ 5 giây: xóa cấu hình và reboot");
+				resetTriggered = true;
+
+				Serial.println("[SYSTEM] Nút giữ 5 giây: xóa cấu hình và reboot");
 
 				prefs.begin("net_cfg", false);
-				prefs.clear(); // Xóa sạch SSID/PASS
+				prefs.clear();
 				prefs.end();
 
-				vTaskDelay(pdMS_TO_TICKS(500));
+				esp_task_wdt_reset();
+				vTaskDelay(pdMS_TO_TICKS(300));
 				ESP.restart();
 			}
 		}
@@ -681,7 +682,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
 	if (strcmp(topic, TOPIC_CONFIG) == 0)
 	{
-		if (length >= 4096)
+		if (length > 4094)
 			return;
 		static char jsonStr[4096];
 		memcpy(jsonStr, payload, length);
@@ -714,6 +715,7 @@ void requestWiFiConnect()
 	LOG("NET", "Đang thử kết nối WiFi...");
 	WiFi.begin(conf_ssid.c_str(), conf_pass.c_str());
 }
+
 void resetModem()
 {
 	pinMode(MODEM_RST, OUTPUT);
@@ -733,8 +735,6 @@ bool connectGSM()
 {
 	LOG("NET", "=== GSM START ===");
 	resetModem();
-	modem.restart();
-
 	esp_task_wdt_reset();
 
 	if (!modem.init())
@@ -751,7 +751,6 @@ bool connectGSM()
 	}
 
 	String imsi = modem.getIMSI();
-	// String auto_apn = "v-internet";
 
 	if (imsi.startsWith("45204"))
 		auto_apn = "v-internet";
@@ -770,9 +769,9 @@ bool connectGSM()
 		return false;
 	if (!modem.isGprsConnected())
 		return false;
-	  LOG("NET", "GSM Connected!");
-	  return true;
-  }
+	LOG("NET", "GSM Connected!");
+	return true;
+}
 
 void connectMQTT() {
   LOG("MQTT", "Đang thử kết nối %s:%d...", conf_mqtt_server.c_str(), conf_mqtt_port);
@@ -818,6 +817,7 @@ void taskNetwork(void *pvParameters){
 			if (!prev_wifi_ok) // Vừa kết nối WiFi (kể cả lần đầu boot)
 			{
 				LOG("NET", "WiFi connected: %s IP:%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+				wifi_start_time = millis();
 			}
 			prev_wifi_ok = true;
 			if (!is_modem_sleeping)
@@ -849,6 +849,7 @@ void taskNetwork(void *pvParameters){
 			if (prev_wifi_ok) // Vừa mất WiFi
 			{
 				LOG("NET", "WiFi disconnected!");
+				wifi_start_time = millis();
 			}
 			prev_wifi_ok = false;
 			if (!gsm_ok || is_modem_sleeping)
@@ -984,7 +985,6 @@ void taskModbus(void *pvParameters)
 				uint8_t qty = myGroups[i].count;
 				uint8_t dType = myGroups[i].dataType;
 				float divisor = myGroups[i].div;
-				// uint8_t rCount = myGroups[i].count;
 				xSemaphoreGive(configMutex);
 
 				node.begin(id, MODBUS_SERIAL);
@@ -1001,7 +1001,7 @@ void taskModbus(void *pvParameters)
 					myGroups[i].hasBeenRead = true;
 
 					int bufferOffset = 0;
-					for (int j = 0; j < myGroups[i].count; j++)
+					for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++)
 					{
 						float rawVal = 0;
 
@@ -1030,8 +1030,7 @@ void taskModbus(void *pvParameters)
 						sdLog("WARN", "MODBUS", _buf);
 					}
 					myGroups[i].isLost = true;
-
-					for (int j = 0; j < myGroups[i].count; j++)
+					for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++)
 					{
 						myGroups[i].lastData[j] = -9999.0;
 					}
@@ -1047,7 +1046,6 @@ void taskModbus(void *pvParameters)
 void taskMQTTPublish(void *pvParameters) {
   static String last_ip = "";
   static String last_wifi = "";
-  static String last_ccid = "";
   static int last_rssi = 0;
   static unsigned long last_data_send = 0;
   static unsigned long last_info_send = 0;
@@ -1061,7 +1059,6 @@ void taskMQTTPublish(void *pvParameters) {
       String current_wifi = "Disconnected";
       int current_rssi = -113;
 
-      // 1. LẤY THÔNG TIN MẠNG (Độc lập, không bị ảnh hưởng bởi MQTT)
       if (WiFi.status() == WL_CONNECTED) {
         current_ip = WiFi.localIP().toString();
         current_wifi = WiFi.SSID();
@@ -1132,7 +1129,7 @@ void taskMQTTPublish(void *pvParameters) {
             snprintf(payload, sizeof(payload), "{\"id%d\":{\"val\":\"ERR\"}}", myGroups[i].id);
         } else {
             offset = snprintf(payload, sizeof(payload), "{\"id%d\":[", myGroups[i].id);
-            for (int j = 0; j < myGroups[i].count; j++) {
+            for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++) {
                 if (j > 0) offset += snprintf(payload + offset, sizeof(payload) - offset, ",");
                 
                 int regAddr = myGroups[i].startReg + (myGroups[i].dataType == 2 ? j * 2 : j);
@@ -1318,7 +1315,7 @@ void setup()
 	xTaskCreatePinnedToCore(taskWebServer, "Web", 8192, NULL, 1, NULL, 1);
 	xTaskCreatePinnedToCore(taskNetwork, "Network", 8192, NULL, 3, NULL, 0);
 
-	xTaskCreatePinnedToCore(taskButton, "Button", 2048, NULL, 1, NULL, 1);
+	xTaskCreatePinnedToCore(taskButton, "Button", 4096, NULL, 1, NULL, 1);
 	xTaskCreatePinnedToCore(taskModbus, "Modbus", 4096, NULL, 2, NULL, 1);
 	xTaskCreatePinnedToCore(taskAlarm, "Alarm", 2048, NULL, 2, NULL, 1);
 

@@ -142,7 +142,6 @@ const char* htmlDashboard = R"rawliteral(
         }
         .unit-header { 
             display: flex; justify-content: space-between; align-items: flex-start; 
-            margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px dashed var(--border); 
         }
         .header-inputs { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; flex: 1; }
         .input-group { display: flex; align-items: center; gap: 6px; }
@@ -156,23 +155,6 @@ const char* htmlDashboard = R"rawliteral(
         input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
         .u-id, .u-start, .u-count, .u-div { width: 70px; font-weight: bold; text-align: center; }
         .u-type { padding: 8px; }
-
-        /* Registers Table-like Grid */
-        .reg-header { 
-            display: grid; grid-template-columns: 1.5fr 1fr 1fr 2fr 50px; gap: 12px; 
-            margin-bottom: 10px; padding: 0 10px; font-weight: 700; font-size: 12px; color: var(--text-sub);
-        }
-        .reg-row { 
-            display: grid; grid-template-columns: 1.5fr 1fr 1fr 2fr 50px; gap: 12px; 
-            margin-bottom: 10px; align-items: center; background: white; padding: 8px; border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-        }
-        .reg-row input, .reg-row select { width: 100%; box-sizing: border-box; }
-        
-        .btn-small-del { 
-            background: none; border: none; color: #cbd5e1; font-size: 18px; cursor: pointer; transition: 0.2s;
-        }
-        .btn-small-del:hover { color: var(--danger); }
 
         /* Avatar dropdown */
         .avatar-wrap { position: relative; }
@@ -227,7 +209,6 @@ const char* htmlDashboard = R"rawliteral(
 <body>
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:25px;">
         <h2 style="margin:0">Control Panel</h2>
-        <!-- Avatar dropdown -->
         <div class="avatar-wrap" id="avatarWrap">
             <div class="avatar" onclick="toggleMenu()" title="Tài khoản" aria-label="Tài khoản">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -253,7 +234,6 @@ const char* htmlDashboard = R"rawliteral(
         </div>
     </div>
 
-
     <!-- Modal Đổi mật khẩu -->
     <div id="changePassModal" class="modal-overlay" onclick="closeModalOnBg(event,'changePassModal')">
         <div class="modal-box">
@@ -272,7 +252,7 @@ const char* htmlDashboard = R"rawliteral(
         </div>
     </div>
 
-   
+    <div class="card">
         <button class="btn btn-add" onclick="addNewSlaveGroup()">+ Add New Slave Unit</button>
         <div id="slaveGroupsContainer"></div>
         <button class="btn btn-save" onclick="saveAllConfig()">Save All Configuration</button>
@@ -280,15 +260,14 @@ const char* htmlDashboard = R"rawliteral(
 
 <script>
 function addNewSlaveGroup(data = {}) {
-    // Giá trị mặc định nếu data trống (chống lỗi khi thêm mới)
-    const id = data.id !== undefined ? data.id : 1;
-    const start = data.start !== undefined ? data.start : 0;
-    const count = data.count !== undefined ? data.count : 1;
+    const id       = data.id       !== undefined ? data.id       : 1;
+    const start    = data.start    !== undefined ? data.start    : 0;
+    const count    = data.count    !== undefined ? data.count    : 1;
     const dataType = data.dataType !== undefined ? data.dataType : 0;
-    const div = data.div !== undefined ? data.div : 1.0;
+    const div      = data.div      !== undefined ? data.div      : 1.0;
 
     const container = document.getElementById('slaveGroupsContainer');
-    const groupDiv = document.createElement('div');
+    const groupDiv  = document.createElement('div');
     groupDiv.className = 'slave-unit';
     groupDiv.innerHTML = `
         <div class="unit-header">
@@ -303,7 +282,7 @@ function addNewSlaveGroup(data = {}) {
                     <b>Count:</b> <input type="number" class="u-count" value="${count}">
                 </div>
                 <div class="input-group">
-                    <b>Type:</b> 
+                    <b>Type:</b>
                     <select class="u-type">
                         <option value="0" ${dataType == 0 ? 'selected' : ''}>16-bit</option>
                         <option value="2" ${dataType == 2 ? 'selected' : ''}>32-bit (Float)</option>
@@ -315,44 +294,16 @@ function addNewSlaveGroup(data = {}) {
             </div>
             <button class="btn btn-del" onclick="this.parentElement.parentElement.remove()">Delete Unit</button>
         </div>
-        <div class="reg-header">
-            <div>Type</div><div>Min</div><div>Max</div><div>Error Message</div><div></div>
-        </div>
-        <div class="regs-list"></div>
-        <button class="btn" style="background:#e2e8f0; color:#475569; font-size:12px; margin-top:10px" onclick="addRegRow(this)">+ Add Register</button>
     `;
     container.appendChild(groupDiv);
-    
-    if (data.regs && data.regs.length > 0) {
-        data.regs.forEach(r => addRegRow(groupDiv.querySelector('button[onclick*="addRegRow"]'), r));
-    } else {
-        addRegRow(groupDiv.querySelector('button[onclick*="addRegRow"]')); 
-    }
-}
-
-function addRegRow(btn, regData = {type: 0, min: 0, max: 100, err: "ERR"}) {
-    const list = btn.previousElementSibling;
-    const row = document.createElement('div');
-    row.className = 'reg-row';
-    row.innerHTML = `
-        <select class="r-type">
-            <option value="0" ${regData.type==0?'selected':''}>0 (Range)</option>
-            <option value="1" ${regData.type==1?'selected':''}>1 (State)</option>
-        </select>
-        <input type="number" step="any" class="r-min" value="${regData.min}">
-        <input type="number" step="any" class="r-max" value="${regData.max}">
-        <input type="text" class="r-err" value="${regData.err}">
-        <button class="btn-small-del" onclick="this.parentElement.remove()">✕</button>
-    `;
-    list.appendChild(row);
 }
 
 function loadData() {
     fetch('/api/info').then(r => r.json()).then(data => {
-        document.getElementById('mac').innerText = data.mac;
-        document.getElementById('ip').innerText = data.ip;
+        document.getElementById('mac').innerText  = data.mac;
+        document.getElementById('ip').innerText   = data.ip;
         document.getElementById('wifi').innerText = data.wifi;
-        document.getElementById('sim').innerText = data.sim_ccid;
+        document.getElementById('sim').innerText  = data.sim_ccid;
         document.getElementById('rssi').innerText = data.rssi + " dBm";
     }).catch(e => console.log("Offline"));
 }
@@ -360,36 +311,26 @@ function loadData() {
 function saveAllConfig() {
     let slaves = [];
     document.querySelectorAll(".slave-unit").forEach(unit => {
-        let group = {
-            id: parseInt(unit.querySelector(".u-id").value),
-            start: parseInt(unit.querySelector(".u-start").value),
-            count: parseInt(unit.querySelector(".u-count").value),
+        slaves.push({
+            id:       parseInt(unit.querySelector(".u-id").value),
+            start:    parseInt(unit.querySelector(".u-start").value),
+            count:    parseInt(unit.querySelector(".u-count").value),
             dataType: parseInt(unit.querySelector(".u-type").value),
-            div: parseFloat(unit.querySelector(".u-div").value),
-            regs: []
-        };
-        unit.querySelectorAll(".reg-row").forEach(row => {
-            group.regs.push({
-                type: parseInt(row.querySelector(".r-type").value),
-                min: parseFloat(row.querySelector(".r-min").value),
-                max: parseFloat(row.querySelector(".r-max").value),
-                err: row.querySelector(".r-err").value
-            });
+            div:      parseFloat(unit.querySelector(".u-div").value)
         });
-        if (group.regs.length > 0) slaves.push(group);
     });
 
     fetch('/api/save_slaves', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ slaves: slaves })
-    }).then(r => r.json()).then(data => alert("Đã lưu cấu hình!"));
+    }).then(r => r.json()).then(() => alert("Đã lưu cấu hình!"));
 }
 
 function fetchSlaves() {
     fetch('/api/slaves').then(r => r.json()).then(data => {
         document.getElementById('slaveGroupsContainer').innerHTML = "";
-        if(data.slaves) data.slaves.forEach(s => addNewSlaveGroup(s));
+        if (data.slaves) data.slaves.forEach(s => addNewSlaveGroup(s));
     });
 }
 
@@ -398,9 +339,9 @@ function closeModal(id) {
     document.getElementById(id).classList.remove('active');
     document.querySelectorAll('#'+id+' input').forEach(i => i.value = '');
     let msg = document.querySelector('#'+id+' .modal-msg');
-    if(msg) { msg.style.display='none'; msg.className='modal-msg'; }
+    if (msg) { msg.style.display='none'; msg.className='modal-msg'; }
 }
-function closeModalOnBg(e, id) { if(e.target === document.getElementById(id)) closeModal(id); }
+function closeModalOnBg(e, id) { if (e.target === document.getElementById(id)) closeModal(id); }
 
 function showModalMsg(modalId, text, isOk) {
     let msg = document.querySelector('#'+modalId+' .modal-msg');
@@ -411,11 +352,11 @@ function showModalMsg(modalId, text, isOk) {
 
 function doChangePass() {
     let old = document.getElementById('oldPass').value;
-    let np = document.getElementById('newPass').value;
-    let cp = document.getElementById('confirmPass').value;
+    let np  = document.getElementById('newPass').value;
+    let cp  = document.getElementById('confirmPass').value;
     if (!old || !np || !cp) { showModalMsg('changePassModal','Vui lòng điền đầy đủ!', false); return; }
-    if (np !== cp) { showModalMsg('changePassModal','Mật khẩu mới không khớp!', false); return; }
-    if (np.length < 4) { showModalMsg('changePassModal','Mật khẩu phải có ít nhất 4 ký tự!', false); return; }
+    if (np !== cp)           { showModalMsg('changePassModal','Mật khẩu mới không khớp!', false); return; }
+    if (np.length < 4)       { showModalMsg('changePassModal','Mật khẩu phải có ít nhất 4 ký tự!', false); return; }
     fetch('/api/change_pass', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -426,29 +367,8 @@ function doChangePass() {
     }).catch(() => showModalMsg('changePassModal','Lỗi kết nối!', false));
 }
 
-function doResetPass() {
-    let pin = document.getElementById('resetPin').value;
-    let np = document.getElementById('resetNewPass').value;
-    let cp = document.getElementById('resetConfirmPass').value;
-    if (!pin || !np || !cp) { showModalMsg('resetPassModal','Vui lòng điền đầy đủ!', false); return; }
-    if (np !== cp) { showModalMsg('resetPassModal','Mật khẩu mới không khớp!', false); return; }
-    if (np.length < 4) { showModalMsg('resetPassModal','Mật khẩu phải có ít nhất 4 ký tự!', false); return; }
-    fetch('/api/reset_pass', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({pin: pin, new_pass: np})
-    }).then(r => r.json()).then(d => {
-        showModalMsg('resetPassModal', d.msg, d.status === 'OK');
-        if (d.status === 'OK') setTimeout(() => { closeModal('resetPassModal'); location.reload(); }, 2000);
-    }).catch(() => showModalMsg('resetPassModal','Lỗi kết nối!', false));
-}
-
-function toggleMenu() {
-    document.getElementById('avatarMenu').classList.toggle('open');
-}
-function closeMenu() {
-    document.getElementById('avatarMenu').classList.remove('open');
-}
+function toggleMenu() { document.getElementById('avatarMenu').classList.toggle('open'); }
+function closeMenu()  { document.getElementById('avatarMenu').classList.remove('open'); }
 document.addEventListener('click', function(e) {
     if (!document.getElementById('avatarWrap').contains(e.target)) closeMenu();
 });
