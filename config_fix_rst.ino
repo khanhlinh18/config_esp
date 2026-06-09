@@ -1,5 +1,18 @@
 #define TINY_GSM_MODEM_SIM7600
+#define FW_VERSION "1.0.1"  
+
+// ================== OTA CONFIG ==================
+#define OTA_VERSION_URL_HTTP  "http://your-server.com/ota/version.json"
+#define OTA_FIRMWARE_URL_HTTP "http://your-server.com/ota/firmware.bin"
+
+#define OTA_VERSION_URL_HTTPS  "https://github.com/khanhlinh18/esp32-OTA/releases/latest/download/version.json"
+#define OTA_FIRMWARE_URL_HTTPS "https://github.com/khanhlinh18/esp32-OTA/releases/latest/download/OTA.ino.bin"
+
+#include "ota_ca_cert.h"
 #include <esp_task_wdt.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -122,7 +135,7 @@ struct SlaveGroup
 	float div;
 	float lastData[MAX_SLAVES];
 	bool isLost;
-	bool hasBeenRead; // true sau khi đọc thành công lần đầu, tránh log LOST khi mới boot
+	bool hasBeenRead; 
 };
 
 SlaveGroup myGroups[MAX_SLAVES];
@@ -239,12 +252,13 @@ void _logPrint(const char* tag, const char* fmt, ...)
 
 #define LOG_MAX_DAYS 7
 
+// Xóa các file log cũ hơn LOG_MAX_DAYS ngày
+// File log có format: /log_YYYY-MM-DD.txt
 void cleanOldLogs()
 {
     if (!sd_ok) return;
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
 
-    // Lấy ngày hiện tại từ RTC/NTP
     DateTime today = rtc_ok ? rtc.now() : DateTime(2000, 1, 1);
 
     File root = SD.open("/");
@@ -254,7 +268,6 @@ void cleanOldLogs()
     File entry = root.openNextFile();
     while (entry)
     {
-      
         String fullName = String(entry.name());
         int slashIdx = fullName.lastIndexOf('/');
         String name = (slashIdx >= 0) ? fullName.substring(slashIdx + 1) : fullName;
@@ -262,7 +275,6 @@ void cleanOldLogs()
 
         if (name.startsWith("log_") && name.endsWith(".txt") && name.length() == 18)
         {
-            // Parse ngày từ tên file: log_YYYY-MM-DD.txt
             int y = name.substring(4, 8).toInt();
             int m = name.substring(9, 11).toInt();
             int d = name.substring(12, 14).toInt();
@@ -299,7 +311,7 @@ void syncNTP()
     configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
     struct tm t;
     int retry = 0;
-    // Tăng retry lên 20 và delay 1.5s — GSM latency cao hơn WiFi
+
     while (!getLocalTime(&t) && retry < 20)
     {
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -330,7 +342,6 @@ void preTransmission() { digitalWrite(MAX485_DE, 1); }
 void postTransmission() { digitalWrite(MAX485_DE, 0); }
 
 // ================== ALARM FROM CLOUD ==================
-// Cloud phụ trách so sánh ngưỡng, ESP chỉ nhận lệnh và kích loa
 void taskAlarm(void *pvParameters)
 {
 	while (1)
@@ -340,7 +351,7 @@ void taskAlarm(void *pvParameters)
 			digitalWrite(RELAY_ALARM, LOW);
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			digitalWrite(RELAY_ALARM, HIGH);
-			alarm_cloud = false; // Reset sau mỗi lần kích
+			alarm_cloud = false; 
 			LOG("ALARM", "Relay kích xong, reset cờ alarm");
 		}
 		else
@@ -413,7 +424,6 @@ void loadConfig()
 
 void setupAPIEndpoints()
 {
-  // Khai báo header cần đọc (bắt buộc cho WebServer ESP32)
   const char* headerKeys[] = {"Cookie"};
   server.collectHeaders(headerKeys, 1);
 
@@ -421,6 +431,7 @@ void setupAPIEndpoints()
     if (!isValidSession()) { server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Unauthorized\"}"); return; }
     JsonDocument doc;
     doc["mac"] = WiFi.macAddress();
+    // doc["version"] = FW_VERSION;  
     
     if (WiFi.status() == WL_CONNECTED) {
         doc["ip"] = WiFi.localIP().toString();
@@ -589,7 +600,6 @@ void taskWebServer(void *pvParameters)
 	}
 	else
 	{
-		// Chờ WiFi hoặc GSM kết nối (không block mãi)
 		uint32_t wait_start = millis();
 		while (WiFi.status() != WL_CONNECTED && !gsm_ok)
 		{
@@ -653,11 +663,9 @@ void taskButton(void *pvParameters)
 				pressing = true;
 				resetTriggered = false;
 			}
-			// Nhấn giữ hơn 5 giây — chỉ xử lý 1 lần (resetTriggered)
 			if (pressing && !resetTriggered && (millis() - pressTime > 5000))
 			{
 				resetTriggered = true;
-
 				Serial.println("[SYSTEM] Nút giữ 5 giây: xóa cấu hình và reboot");
 
 				prefs.begin("net_cfg", false);
@@ -692,7 +700,6 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 	}
 	else if (strcmp(topic, TOPIC_ALARM) == 0)
 	{
-		// Cloud gửi "1" = bật loa, "0" = tắt loa
 		if (length > 0)
 		{
 			bool prev = alarm_cloud;
@@ -735,6 +742,7 @@ bool connectGSM()
 {
 	LOG("NET", "=== GSM START ===");
 	resetModem();
+
 	esp_task_wdt_reset();
 
 	if (!modem.init())
@@ -814,12 +822,13 @@ void taskNetwork(void *pvParameters){
 
 		if (current_wifi_ok)
 		{
-			if (!prev_wifi_ok) // Vừa kết nối WiFi (kể cả lần đầu boot)
+			if (!prev_wifi_ok) 
 			{
 				LOG("NET", "WiFi connected: %s IP:%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 				wifi_start_time = millis();
 			}
 			prev_wifi_ok = true;
+			network_ok = true; 
 			if (!is_modem_sleeping)
 			{
 				LOG("NET", "Đã có WiFi, tắt SIM tiết kiệm điện");
@@ -827,7 +836,6 @@ void taskNetwork(void *pvParameters){
 				is_modem_sleeping = true;
 				gsm_ok = false;
 			}
-			// Sync NTP: lần đầu hoặc mỗi 6 giờ để cập nhật RTC
 			static uint32_t last_ntp_sync = 0;
 			static uint32_t last_log_clean = 0;
 			if (!ntp_synced || millis() - last_ntp_sync > 6UL * 3600UL * 1000UL)
@@ -835,7 +843,6 @@ void taskNetwork(void *pvParameters){
 				syncNTP();
 				last_ntp_sync = millis();
 			}
-			// Dọn log cũ mỗi 24 giờ
 			if (millis() - last_log_clean > 24UL * 3600UL * 1000UL || last_log_clean == 0)
 			{
 				cleanOldLogs();
@@ -846,10 +853,11 @@ void taskNetwork(void *pvParameters){
 		}
 		else
 		{
-			if (prev_wifi_ok) // Vừa mất WiFi
+			if (prev_wifi_ok) 
 			{
 				LOG("NET", "WiFi disconnected!");
 				wifi_start_time = millis();
+				network_ok = false; 
 			}
 			prev_wifi_ok = false;
 			if (!gsm_ok || is_modem_sleeping)
@@ -867,11 +875,11 @@ void taskNetwork(void *pvParameters){
 					if (gsm_ok)
 					{
 						is_modem_sleeping = false;
+						network_ok = true; 
 						mqtt.setClient(gsmClient);
 						last_wifi_recheck = millis();
 						last_mqtt_retry = 0;
 
-						// Chờ GPRS ổn định rồi lấy IP
 						vTaskDelay(pdMS_TO_TICKS(2000));
 						global_gsm_ip = modem.localIP().toString();
 						if (global_gsm_ip == "0.0.0.0" || global_gsm_ip == "") {
@@ -880,7 +888,6 @@ void taskNetwork(void *pvParameters){
 						}
 						LOG("NET", "GSM connected, IP: %s", global_gsm_ip.c_str());
 
-						// Sync NTP qua GSM — retry tối đa 3 lần, mỗi lần cách 5s
 						if (!ntp_synced) {
 							for (int _r = 0; _r < 3 && !ntp_synced; _r++) {
 								vTaskDelay(pdMS_TO_TICKS(5000));
@@ -926,14 +933,11 @@ void taskNetwork(void *pvParameters){
 					{
 						LOG("NET", "Không tìm thấy WiFi, quay lại GSM");
 						WiFi.mode(WIFI_OFF);
-						// Cần dừng Client cũ để tránh treo Socket
 						gsmClient.stop();
-						// Kiểm tra lại GPRS
 						if (!modem.isGprsConnected())
 						{
 							modem.gprsConnect(auto_apn.c_str(), "", "");
 						}
-						// Ép kết nối lại MQTT ngay vòng lặp sau
 						last_mqtt_retry = 0;
 					}
 					last_wifi_recheck = millis();
@@ -1030,6 +1034,7 @@ void taskModbus(void *pvParameters)
 						sdLog("WARN", "MODBUS", _buf);
 					}
 					myGroups[i].isLost = true;
+
 					for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++)
 					{
 						myGroups[i].lastData[j] = -9999.0;
@@ -1059,6 +1064,7 @@ void taskMQTTPublish(void *pvParameters) {
       String current_wifi = "Disconnected";
       int current_rssi = -113;
 
+      // 1. LẤY THÔNG TIN MẠNG (Độc lập, không bị ảnh hưởng bởi MQTT)
       if (WiFi.status() == WL_CONNECTED) {
         current_ip = WiFi.localIP().toString();
         current_wifi = WiFi.SSID();
@@ -1156,6 +1162,217 @@ void taskMQTTPublish(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
+// ================== TASK OTA ==================
+// So sánh version
+bool isNewerVersion(const String& current, const String& latest) {
+    int c1=0,c2=0,c3=0, l1=0,l2=0,l3=0;
+    sscanf(current.c_str(), "%d.%d.%d", &c1, &c2, &c3);
+    sscanf(latest.c_str(),  "%d.%d.%d", &l1, &l2, &l3);
+    if (l1 != c1) return l1 > c1;
+    if (l2 != c2) return l2 > c2;
+    return l3 > c3;
+}
+
+// ---- BẢN HTTP (không cần CA cert) ----
+void taskOTA_HTTP(void *pvParameters)
+{
+    // Chờ hệ thống kết nối mạng ổn định sau khi boot
+    vTaskDelay(pdMS_TO_TICKS(30000));
+
+    const uint32_t CHECK_INTERVAL = 24UL * 60UL * 60UL * 1000UL; // 24 giờ
+    uint32_t last_check = 0;
+
+    while (1)
+    {
+        // Kiểm tra mỗi 24 giờ, hoặc ngay lần đầu
+        if (millis() - last_check < CHECK_INTERVAL && last_check != 0) {
+            vTaskDelay(pdMS_TO_TICKS(60000)); // ngủ 1 phút rồi check lại điều kiện
+            continue;
+        }
+
+        // Chỉ OTA khi đang có mạng
+        if (!network_ok) {
+            vTaskDelay(pdMS_TO_TICKS(60000));
+            continue;
+        }
+
+        last_check = millis();
+        LOG("OTA", "Kiểm tra firmware mới...");
+
+        // Bước 1: Lấy version.json từ server
+        HTTPClient http;
+        http.begin(OTA_VERSION_URL_HTTP);
+        int httpCode = http.GET();
+
+        if (httpCode != 200) {
+            LOG("OTA", "Không lấy được version, HTTP code: %d", httpCode);
+            http.end();
+            vTaskDelay(pdMS_TO_TICKS(60000));
+            continue;
+        }
+
+        String payload = http.getString();
+        http.end();
+
+        JsonDocument doc;
+        if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+            LOG("OTA", "JSON version không hợp lệ: %s", payload.c_str());
+            continue;
+        }
+        String latestVersion = doc["version"] | "";
+        if (latestVersion == "") {
+            LOG("OTA", "Không tìm thấy field 'version' trong JSON");
+            continue;
+        }
+
+        LOG("OTA", "Version hiện tại: %s | Mới nhất: %s", FW_VERSION, latestVersion.c_str());
+
+        // Bước 2: So sánh version
+        if (!isNewerVersion(FW_VERSION, latestVersion)) {
+            LOG("OTA", "Đang dùng firmware mới nhất, bỏ qua");
+            continue;
+        }
+
+        // Bước 3: Có bản mới → tiến hành OTA
+        LOG("OTA", "Có bản mới %s → bắt đầu tải firmware...", latestVersion.c_str());
+        sdLog("INFO", "OTA", String("Updating to v") + latestVersion);
+
+        WiFiClient otaClient;
+        httpUpdate.setLedPin(LED_AP, LOW);
+        httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); 
+
+        // Callback khi update xong → tự reboot
+        httpUpdate.onEnd([](){ LOG("OTA", "Update xong, reboot..."); });
+        httpUpdate.onError([](int err){ LOG("OTA", "Lỗi OTA: %d", err); });
+        httpUpdate.onProgress([](int cur, int total){
+            static int lastPct = -1;
+            int pct = (cur * 100) / total;
+            if (pct != lastPct && pct % 10 == 0) { // Log mỗi 10%
+                LOG("OTA", "Tiến trình: %d%%", pct);
+                lastPct = pct;
+            }
+        });
+
+        t_httpUpdate_return ret = httpUpdate.update(otaClient, OTA_FIRMWARE_URL_HTTP);
+
+        switch (ret) {
+            case HTTP_UPDATE_OK:
+                break;
+            case HTTP_UPDATE_FAILED:
+                LOG("OTA", "Update thất bại: %s", httpUpdate.getLastErrorString().c_str());
+                sdLog("WARN", "OTA", String("Failed: ") + httpUpdate.getLastErrorString());
+                break;
+            case HTTP_UPDATE_NO_UPDATES:
+                LOG("OTA", "Server báo không có bản mới");
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
+// ---- BẢN HTTPS (có CA cert, dùng khi server production) ----
+void taskOTA_HTTPS(void *pvParameters)
+{
+    // Chờ hệ thống kết nối mạng ổn định sau khi boot
+    LOG("OTA", "Task OTA khởi động, chờ 30s...");
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    LOG("OTA", "Bắt đầu vòng lặp OTA, network_ok=%d", (int)network_ok);
+
+    const uint32_t CHECK_INTERVAL = 24UL * 60UL * 60UL * 1000UL; // 24 giờ
+    uint32_t last_check = 0;
+
+    while (1)
+    {
+        if (millis() - last_check < CHECK_INTERVAL && last_check != 0) {
+            vTaskDelay(pdMS_TO_TICKS(60000));
+            continue;
+        }
+
+        if (!network_ok) {
+            LOG("OTA", "Chờ mạng... network_ok=%d", (int)network_ok);
+            vTaskDelay(pdMS_TO_TICKS(60000));
+            continue;
+        }
+
+        last_check = millis();
+        LOG("OTA", "Kiểm tra firmware mới (HTTPS)...");
+
+        // Bước 1: Lấy version.json qua HTTPS
+        WiFiClientSecure versionClient;
+        versionClient.setInsecure();
+
+        HTTPClient https;
+        https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+        https.begin(versionClient, OTA_VERSION_URL_HTTPS);
+        int httpCode = https.GET();
+
+        if (httpCode != 200) {
+            LOG("OTA", "Không lấy được version, HTTP code: %d", httpCode);
+            https.end();
+            vTaskDelay(pdMS_TO_TICKS(60000));
+            continue;
+        }
+
+        String payload = https.getString();
+        https.end();
+
+        // Parse JSON
+        JsonDocument doc;
+        if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+            LOG("OTA", "JSON version không hợp lệ: %s", payload.c_str());
+            continue;
+        }
+        String latestVersion = doc["version"] | "";
+        if (latestVersion == "") {
+            LOG("OTA", "Không tìm thấy field 'version' trong JSON");
+            continue;
+        }
+
+        LOG("OTA", "Version hiện tại: %s | Mới nhất: %s", FW_VERSION, latestVersion.c_str());
+
+        // Bước 2: So sánh version
+        if (!isNewerVersion(FW_VERSION, latestVersion)) {
+            LOG("OTA", "Đang dùng firmware mới nhất, bỏ qua");
+            continue;
+        }
+
+        // Bước 3: Có bản mới → OTA qua HTTPS
+        LOG("OTA", "Có bản mới %s → bắt đầu tải firmware (HTTPS)...", latestVersion.c_str());
+        sdLog("INFO", "OTA", String("Updating to v") + latestVersion);
+
+        WiFiClientSecure otaClient;
+        otaClient.setInsecure(); // GitHub redirect sang domain khác
+        httpUpdate.setLedPin(LED_AP, LOW);
+        httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+        httpUpdate.onProgress([](int cur, int total){
+            static int lastPct = -1;
+            int pct = (cur * 100) / total;
+            if (pct != lastPct && pct % 10 == 0) {
+                LOG("OTA", "Tiến trình: %d%%", pct);
+                lastPct = pct;
+            }
+        });
+
+        t_httpUpdate_return ret = httpUpdate.update(otaClient, OTA_FIRMWARE_URL_HTTPS);
+
+        switch (ret) {
+            case HTTP_UPDATE_OK:
+                break;
+            case HTTP_UPDATE_FAILED:
+                LOG("OTA", "Update thất bại: %s", httpUpdate.getLastErrorString().c_str());
+                sdLog("WARN", "OTA", String("Failed: ") + httpUpdate.getLastErrorString());
+                break;
+            case HTTP_UPDATE_NO_UPDATES:
+                LOG("OTA", "Server báo không có bản mới");
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
 // ================== TASK WATCHDOG ==================
 void taskWatchdog(void *pvParameters)
 {
@@ -1310,14 +1527,18 @@ void setup()
 	node.preTransmission(preTransmission);
 	node.postTransmission(postTransmission);
 
-	xTaskCreatePinnedToCore(taskWatchdog, "Watchdog", 4096, NULL, 3, NULL, 0);
-	xTaskCreatePinnedToCore(taskMQTTPublish, "MQTTPub", 6144, NULL, 2, NULL, 1);
-	xTaskCreatePinnedToCore(taskWebServer, "Web", 8192, NULL, 1, NULL, 1);
-	xTaskCreatePinnedToCore(taskNetwork, "Network", 8192, NULL, 3, NULL, 0);
+	xTaskCreatePinnedToCore(taskWatchdog,    "Watchdog", 4096, NULL, 3, NULL, 0);
+	xTaskCreatePinnedToCore(taskMQTTPublish, "MQTTPub",  6144, NULL, 2, NULL, 1);
+	xTaskCreatePinnedToCore(taskWebServer,   "Web",      8192, NULL, 1, NULL, 1);
+	xTaskCreatePinnedToCore(taskNetwork,     "Network",  8192, NULL, 3, NULL, 0);
 
-	xTaskCreatePinnedToCore(taskButton, "Button", 4096, NULL, 1, NULL, 1);
-	xTaskCreatePinnedToCore(taskModbus, "Modbus", 4096, NULL, 2, NULL, 1);
-	xTaskCreatePinnedToCore(taskAlarm, "Alarm", 2048, NULL, 2, NULL, 1);
+	xTaskCreatePinnedToCore(taskButton,  "Button", 4096, NULL, 1, NULL, 1);
+	xTaskCreatePinnedToCore(taskModbus,  "Modbus", 4096, NULL, 2, NULL, 1);
+	xTaskCreatePinnedToCore(taskAlarm,   "Alarm",  2048, NULL, 2, NULL, 1);
+
+	// Dùng HTTPS với CA cert của GitHub
+	// xTaskCreatePinnedToCore(taskOTA_HTTP,  "OTA", 8192, NULL, 1, NULL, 0);
+	xTaskCreatePinnedToCore(taskOTA_HTTPS, "OTA", 12288, NULL, 1, NULL, 0);
 
 	esp_task_wdt_delete(NULL);
 	LOG("SYSTEM", "Setup hoàn tất");
