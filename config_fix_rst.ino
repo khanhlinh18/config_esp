@@ -1,5 +1,5 @@
 #define TINY_GSM_MODEM_SIM7600
-#define FW_VERSION "1.0.1"  
+#define FW_VERSION "1.0.0"   // <-- Tăng lên mỗi lần build firmware mới
 
 // ================== OTA CONFIG ==================
 #define OTA_VERSION_URL_HTTP  "http://your-server.com/ota/version.json"
@@ -40,7 +40,6 @@
 #define MODBUS_SERIAL Serial1
 #define RXD2 17
 #define TXD2 16
-#define RELAY_ALARM 12   // Relay kích loa khi nhận alarm từ cloud
 #define SETUP_BUTTON 0
 #define LED_AP 13
 // ================== SD CARD (SPI) ==================
@@ -57,7 +56,6 @@
 TinyGsm modem(SerialAT);
 TinyGsmClient gsmClient(modem);
 WiFiClient wifiClient;
-
 PubSubClient mqtt(wifiClient);
 ModbusMaster node;
 Preferences prefs;
@@ -81,8 +79,8 @@ bool network_ok = false;
 bool mqtt_ok = false;
 
 const char *www_user = "admin";
-const char *MASTER_PIN = "12345"; // PIN bí mật để reset mật khẩu
-String www_pass_str = "cuctac";   // Mật khẩu động, load từ NVS
+const char *MASTER_PIN = "12345"; // PIN reset mật khẩu
+String www_pass_str = "cuctac";  
 
 // ================== SESSION TOKEN ==================
 #define SESSION_TIMEOUT_MS  (30UL * 60UL * 1000UL)  // 30 phút
@@ -117,15 +115,14 @@ void redirectToDashboard() {
     server.send(302, "text/plain", "");
 }
 
-volatile bool alarm_cloud = false; // Cờ nhận alarm từ cloud
+volatile bool alarm_cloud = false; // Cờ có cảnh báo mới từ cloud
+String alarm_message = "";         // Nội dung cảnh báo từ cloud
 
-const char *TOPIC_DATA   = "factory/device10/data";
 const char *TOPIC_CONFIG = "factory/device10/config";
-const char *TOPIC_ALARM  = "factory/device10/alarm"; // Subscribe để nhận lệnh từ cloud
+const char *TOPIC_ALARM  = "factory/device10/alarm"; 
 const char *TOPIC_INFO   = "factory/device10/info";
 
 // ================== MODBUS STRUCT  ==================
-
 struct SlaveGroup
 {
 	uint8_t id;
@@ -142,12 +139,12 @@ SlaveGroup myGroups[MAX_SLAVES];
 uint8_t totalGroups = 0;
 
 volatile bool setup_mode = false;
-
 uint32_t setup_start_time = 0;
 
 SemaphoreHandle_t configMutex;
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t mqttMutex;
+SemaphoreHandle_t modbusMutex; // Bảo vệ bus RS485 dùng chung giữa taskModbus và taskAlarm
 
 // ================== SD LOGGER ==================
 SemaphoreHandle_t sdMutex;
@@ -163,7 +160,6 @@ bool rtc_synced = false;
 #define GMT_OFFSET_SEC   (7 * 3600)   // UTC+7 Việt Nam
 #define DST_OFFSET_SEC   0
 
-// Lấy timestamp: ưu tiên NTP → fallback RTC → unknown
 String getTimestamp()
 {
     struct tm t;
@@ -209,7 +205,11 @@ void sdLog(const char* level, const char* tag, const char* msg)
 {
     if (!sd_ok) return;
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    xSemaphoreGive(sdMutex); 
 
+    ensureSDSpace(); 
+
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
     String filename = "/log_" + getDateStr() + ".txt";
     File f = SD.open(filename, FILE_APPEND);
     if (f)
@@ -234,7 +234,6 @@ void _logPrint(const char* tag, const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    // In Serial
     Serial.printf("[%s] %s\n", tag, buf);
 
     // Ghi SD (phân loại level tự động theo nội dung)
@@ -249,22 +248,16 @@ void _logPrint(const char* tag, const char* fmt, ...)
     sdLog(level, tag, buf);
 }
 #define LOG(tag, fmt, ...) _logPrint(tag, fmt, ##__VA_ARGS__)
+#define SD_MIN_FREE_BYTES  (512ULL * 1024ULL)
 
-#define LOG_MAX_DAYS 7
-
-// Xóa các file log cũ hơn LOG_MAX_DAYS ngày
-// File log có format: /log_YYYY-MM-DD.txt
-void cleanOldLogs()
+String deleteOldestLog()
 {
-    if (!sd_ok) return;
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-
-    DateTime today = rtc_ok ? rtc.now() : DateTime(2000, 1, 1);
+    String todayFile = "log_" + getDateStr() + ".txt"; // File hôm nay — không được xóa
 
     File root = SD.open("/");
-    if (!root) { xSemaphoreGive(sdMutex); return; }
+    if (!root) return "";
 
-    int deleted = 0;
+    String oldestName = "";
     File entry = root.openNextFile();
     while (entry)
     {
@@ -273,37 +266,56 @@ void cleanOldLogs()
         String name = (slashIdx >= 0) ? fullName.substring(slashIdx + 1) : fullName;
         entry.close();
 
-        if (name.startsWith("log_") && name.endsWith(".txt") && name.length() == 18)
+        if (name.startsWith("log_") && name.endsWith(".txt") && name.length() == 18
+            && name != todayFile) // Bỏ qua file hôm nay
         {
-            int y = name.substring(4, 8).toInt();
-            int m = name.substring(9, 11).toInt();
-            int d = name.substring(12, 14).toInt();
-
-            if (y > 2000) // File hợp lệ
-            {
-                DateTime fileDate(y, m, d, 0, 0, 0);
-                long diffDays = ((long)today.unixtime() - (long)fileDate.unixtime()) / 86400L;
-
-                if (diffDays >= LOG_MAX_DAYS)
-                {
-                    String pathToDelete = "/" + name;
-                    SD.remove(pathToDelete);
-                    deleted++;
-                    LOG("SD", "Xóa log cũ: %s", name.c_str());
-                }
-            }
+            if (oldestName == "" || name < oldestName)
+                oldestName = name;
         }
         entry = root.openNextFile();
     }
     root.close();
-    xSemaphoreGive(sdMutex);
 
-    if (deleted > 0)
+    if (oldestName != "")
     {
-        char buf[40];
-        snprintf(buf, sizeof(buf), "Deleted %d old log file(s)", deleted);
-        sdLog("INFO", "SD", buf);
+        SD.remove("/" + oldestName);
+        return oldestName;
     }
+    return ""; // Không còn file cũ nào để xóa
+}
+
+// Kiểm tra dung lượng SD và xóa log cũ nếu cần
+void ensureSDSpace()
+{
+    if (!sd_ok) return;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+
+    uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+
+    while (freeBytes < SD_MIN_FREE_BYTES)
+    {
+        String deleted = deleteOldestLog();
+        if (deleted == "")
+        {
+            Serial.println("[SD] Cảnh báo: Không còn log cũ để xóa, SD gần đầy!");
+            break;
+        }
+
+        String auditFile = "/log_" + getDateStr() + ".txt";
+        File f = SD.open(auditFile, FILE_APPEND);
+        if (f)
+        {
+            f.printf("%s [WARN] [SD] Xóa log cũ do hết dung lượng: %s (free: %lluKB)\n",
+                     getTimestamp().c_str(), deleted.c_str(), freeBytes / 1024);
+            f.close();
+        }
+        Serial.printf("[SD] Xóa log cũ do hết dung lượng: %s (free: %lluKB)\n",
+                      deleted.c_str(), freeBytes / 1024);
+
+        freeBytes = SD.totalBytes() - SD.usedBytes();
+    }
+
+    xSemaphoreGive(sdMutex);
 }
 
 void syncNTP()
@@ -311,7 +323,6 @@ void syncNTP()
     configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
     struct tm t;
     int retry = 0;
-
     while (!getLocalTime(&t) && retry < 20)
     {
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -320,7 +331,7 @@ void syncNTP()
     if (getLocalTime(&t))
     {
         ntp_synced = true;
-        if (rtc_ok && !rtc_synced)
+        if (rtc_ok) // Luôn cập nhật RTC mỗi lần NTP sync thành công
         {
             rtc.adjust(DateTime(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                                 t.tm_hour, t.tm_min, t.tm_sec));
@@ -342,24 +353,50 @@ void preTransmission() { digitalWrite(MAX485_DE, 1); }
 void postTransmission() { digitalWrite(MAX485_DE, 0); }
 
 // ================== ALARM FROM CLOUD ==================
+#define RELAY_MODBUS_ID    100    
+#define RELAY_COIL_ADDR    0x0000  
+
+void writeRelayRS485(bool state)
+{
+    if (xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    node.begin(RELAY_MODBUS_ID, MODBUS_SERIAL);
+    preTransmission();
+    uint8_t result = node.writeSingleCoil(RELAY_COIL_ADDR, state ? 0xFF00 : 0x0000);
+    postTransmission();
+    xSemaphoreGive(modbusMutex);
+    if (result != node.ku8MBSuccess)
+    {
+        LOG("ALARM", "Ghi relay RS485 thất bại, mã lỗi: %d", result);
+    }
+}
+
 void taskAlarm(void *pvParameters)
 {
-	while (1)
-	{
-		if (alarm_cloud)
-		{
-			digitalWrite(RELAY_ALARM, LOW);
-			vTaskDelay(pdMS_TO_TICKS(1000));
-			digitalWrite(RELAY_ALARM, HIGH);
-			alarm_cloud = false; 
-			LOG("ALARM", "Relay kích xong, reset cờ alarm");
-		}
-		else
-		{
-			digitalWrite(RELAY_ALARM, HIGH);
-			vTaskDelay(pdMS_TO_TICKS(500));
-		}
-	}
+    bool lastRelayState = false; 
+
+    while (1)
+    {
+        if (alarm_cloud)
+        {
+            // Kích relay BẬT → chờ 1s → TẮT → chờ 1s → lặp lại khi còn cảnh báo
+            writeRelayRS485(true);
+            lastRelayState = true;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            writeRelayRS485(false);
+            lastRelayState = false;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        else
+        {
+            // Chỉ gửi lệnh tắt 1 lần khi vừa chuyển từ có cảnh báo → không còn
+            if (lastRelayState)
+            {
+                writeRelayRS485(false);
+                lastRelayState = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
 }
 
 // ================== NVS & CONFIG LOGIC ==================
@@ -370,7 +407,6 @@ void updateConfigFromJSON(const char *jsonStr)
 	if (error) return;
 
 	JsonArray slaves = doc["slaves"].as<JsonArray>();
-
 	if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(5000)) == pdTRUE)
 	{
 		memset(myGroups, 0, sizeof(myGroups));
@@ -406,7 +442,7 @@ void loadConfig()
 	conf_pass = prefs.getString("pass", "");
 	conf_mqtt_server = prefs.getString("mqtt_srv", "broker.emqx.io");
 	conf_mqtt_port = prefs.getInt("mqtt_port", 1883);
-	www_pass_str = prefs.getString("www_pass", "cuctac"); // Load mật khẩu web
+	www_pass_str = prefs.getString("www_pass", "cuctac"); 
 	prefs.end();
 
 	prefs.begin("modbus_cfg", false);
@@ -430,9 +466,7 @@ void setupAPIEndpoints()
   server.on("/api/info", HTTP_GET, []() {
     if (!isValidSession()) { server.send(401, "application/json", "{\"status\":\"ERR\",\"msg\":\"Unauthorized\"}"); return; }
     JsonDocument doc;
-    doc["mac"] = WiFi.macAddress();
-    // doc["version"] = FW_VERSION;  
-    
+    doc["mac"] = WiFi.macAddress();    
     if (WiFi.status() == WL_CONNECTED) {
         doc["ip"] = WiFi.localIP().toString();
         doc["wifi"] = WiFi.SSID();
@@ -651,7 +685,7 @@ void taskButton(void *pvParameters)
 	pinMode(SETUP_BUTTON, INPUT_PULLUP);
 	uint32_t pressTime = 0;
 	bool pressing = false;
-	bool resetTriggered = false; // Cờ chống kích hoạt nhiều lần
+	bool resetTriggered = false; 
 
 	while (1)
 	{
@@ -663,6 +697,7 @@ void taskButton(void *pvParameters)
 				pressing = true;
 				resetTriggered = false;
 			}
+			// Nhấn giữ hơn 5 giây — chỉ xử lý 1 lần (resetTriggered)
 			if (pressing && !resetTriggered && (millis() - pressTime > 5000))
 			{
 				resetTriggered = true;
@@ -702,12 +737,32 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 	{
 		if (length > 0)
 		{
-			bool prev = alarm_cloud;
-			alarm_cloud = (payload[0] == '1');
-			LOG("ALARM", "Cloud alarm: %s", alarm_cloud ? "BẬT" : "TẮT");
-			if (alarm_cloud != prev)
-				sdLog(alarm_cloud ? "WARN" : "INFO", "ALARM",
-				      alarm_cloud ? "Cloud alarm ON" : "Cloud alarm OFF");
+			// Chuyển payload thành String
+			char buf[256];
+			int len = (length < sizeof(buf) - 1) ? length : sizeof(buf) - 1;
+			memcpy(buf, payload, len);
+			buf[len] = '\0';
+			String msg = String(buf);
+
+			if (msg == "normal")
+			{
+				// Không có cảnh báo → tắt relay nếu đang bật
+				if (alarm_cloud)
+				{
+					alarm_cloud = false;
+					alarm_message = "";
+					LOG("ALARM", "Cloud: Hết cảnh báo → tắt relay");
+					sdLog("INFO", "ALARM", "Cloud cleared alarm");
+				}
+			}
+			else
+			{
+				// Có cảnh báo mới
+				alarm_cloud = true;
+				alarm_message = msg;
+				LOG("ALARM", "Có cảnh báo: %s", msg.c_str());
+				sdLog("WARN", "ALARM", String("Có cảnh báo: ") + msg);
+			}
 		}
 	}
 }
@@ -742,7 +797,6 @@ bool connectGSM()
 {
 	LOG("NET", "=== GSM START ===");
 	resetModem();
-
 	esp_task_wdt_reset();
 
 	if (!modem.init())
@@ -836,24 +890,19 @@ void taskNetwork(void *pvParameters){
 				is_modem_sleeping = true;
 				gsm_ok = false;
 			}
+			// Sync NTP: lần đầu hoặc mỗi 6 giờ để cập nhật RTC
 			static uint32_t last_ntp_sync = 0;
-			static uint32_t last_log_clean = 0;
 			if (!ntp_synced || millis() - last_ntp_sync > 6UL * 3600UL * 1000UL)
 			{
 				syncNTP();
 				last_ntp_sync = millis();
-			}
-			if (millis() - last_log_clean > 24UL * 3600UL * 1000UL || last_log_clean == 0)
-			{
-				cleanOldLogs();
-				last_log_clean = millis();
 			}
 			mqtt.setClient(wifiClient);
 			last_wifi_recheck = millis();
 		}
 		else
 		{
-			if (prev_wifi_ok) 
+			if (prev_wifi_ok) // Vừa mất WiFi
 			{
 				LOG("NET", "WiFi disconnected!");
 				wifi_start_time = millis();
@@ -888,6 +937,7 @@ void taskNetwork(void *pvParameters){
 						}
 						LOG("NET", "GSM connected, IP: %s", global_gsm_ip.c_str());
 
+						// Sync NTP qua GSM — retry tối đa 3 lần, mỗi lần cách 5s
 						if (!ntp_synced) {
 							for (int _r = 0; _r < 3 && !ntp_synced; _r++) {
 								vTaskDelay(pdMS_TO_TICKS(5000));
@@ -984,15 +1034,20 @@ void taskModbus(void *pvParameters)
 			for (int i = 0; i < totalGroups; i++)
 			{
 				xSemaphoreTake(configMutex, portMAX_DELAY);
-				uint8_t id = myGroups[i].id;
+			uint8_t id = myGroups[i].id;
 				uint16_t start = myGroups[i].startReg;
 				uint8_t qty = myGroups[i].count;
 				uint8_t dType = myGroups[i].dataType;
 				float divisor = myGroups[i].div;
-				xSemaphoreGive(configMutex);
+			xSemaphoreGive(configMutex);
 
+			if (xSemaphoreTake(modbusMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+				vTaskDelay(pdMS_TO_TICKS(150));
+				continue;
+			}
 				node.begin(id, MODBUS_SERIAL);
 				uint8_t result = node.readHoldingRegisters(start, qty);
+			xSemaphoreGive(modbusMutex);
 
 				xSemaphoreTake(dataMutex, portMAX_DELAY);
 				if (result == node.ku8MBSuccess)
@@ -1035,6 +1090,7 @@ void taskModbus(void *pvParameters)
 					}
 					myGroups[i].isLost = true;
 
+					// FIX #2: Giới hạn j < MAX_SLAVES để an toàn
 					for (int j = 0; j < myGroups[i].count && j < MAX_SLAVES; j++)
 					{
 						myGroups[i].lastData[j] = -9999.0;
@@ -1064,7 +1120,7 @@ void taskMQTTPublish(void *pvParameters) {
       String current_wifi = "Disconnected";
       int current_rssi = -113;
 
-      // 1. LẤY THÔNG TIN MẠNG (Độc lập, không bị ảnh hưởng bởi MQTT)
+      // 1. LẤY THÔNG TIN MẠNG 
       if (WiFi.status() == WL_CONNECTED) {
         current_ip = WiFi.localIP().toString();
         current_wifi = WiFi.SSID();
@@ -1163,7 +1219,7 @@ void taskMQTTPublish(void *pvParameters) {
   }
 }
 // ================== TASK OTA ==================
-// So sánh version
+// So sánh version string kiểu "1.0.0" < "1.0.1" → true
 bool isNewerVersion(const String& current, const String& latest) {
     int c1=0,c2=0,c3=0, l1=0,l2=0,l3=0;
     sscanf(current.c_str(), "%d.%d.%d", &c1, &c2, &c3);
@@ -1186,7 +1242,7 @@ void taskOTA_HTTP(void *pvParameters)
     {
         // Kiểm tra mỗi 24 giờ, hoặc ngay lần đầu
         if (millis() - last_check < CHECK_INTERVAL && last_check != 0) {
-            vTaskDelay(pdMS_TO_TICKS(60000)); // ngủ 1 phút rồi check lại điều kiện
+            vTaskDelay(pdMS_TO_TICKS(60000)); 
             continue;
         }
 
@@ -1214,6 +1270,7 @@ void taskOTA_HTTP(void *pvParameters)
         String payload = http.getString();
         http.end();
 
+        // Parse JSON lấy version
         JsonDocument doc;
         if (deserializeJson(doc, payload) != DeserializationError::Ok) {
             LOG("OTA", "JSON version không hợp lệ: %s", payload.c_str());
@@ -1239,7 +1296,7 @@ void taskOTA_HTTP(void *pvParameters)
 
         WiFiClient otaClient;
         httpUpdate.setLedPin(LED_AP, LOW);
-        httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); 
+        httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); // Cần thiết cho GitHub redirect
 
         // Callback khi update xong → tự reboot
         httpUpdate.onEnd([](){ LOG("OTA", "Update xong, reboot..."); });
@@ -1271,7 +1328,7 @@ void taskOTA_HTTP(void *pvParameters)
     }
 }
 
-// ---- BẢN HTTPS (có CA cert, dùng khi server production) ----
+// ---- BẢN HTTPS (có CA cert) ----
 void taskOTA_HTTPS(void *pvParameters)
 {
     // Chờ hệ thống kết nối mạng ổn định sau khi boot
@@ -1298,7 +1355,6 @@ void taskOTA_HTTPS(void *pvParameters)
         last_check = millis();
         LOG("OTA", "Kiểm tra firmware mới (HTTPS)...");
 
-        // Bước 1: Lấy version.json qua HTTPS
         WiFiClientSecure versionClient;
         versionClient.setInsecure();
 
@@ -1331,18 +1387,18 @@ void taskOTA_HTTPS(void *pvParameters)
 
         LOG("OTA", "Version hiện tại: %s | Mới nhất: %s", FW_VERSION, latestVersion.c_str());
 
-        // Bước 2: So sánh version
+        // So sánh version
         if (!isNewerVersion(FW_VERSION, latestVersion)) {
             LOG("OTA", "Đang dùng firmware mới nhất, bỏ qua");
             continue;
         }
 
-        // Bước 3: Có bản mới → OTA qua HTTPS
+        // Có bản mới → OTA qua HTTPS
         LOG("OTA", "Có bản mới %s → bắt đầu tải firmware (HTTPS)...", latestVersion.c_str());
         sdLog("INFO", "OTA", String("Updating to v") + latestVersion);
 
         WiFiClientSecure otaClient;
-        otaClient.setInsecure(); // GitHub redirect sang domain khác
+        otaClient.setInsecure(); 
         httpUpdate.setLedPin(LED_AP, LOW);
         httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
@@ -1455,6 +1511,7 @@ void setup()
 	configMutex = xSemaphoreCreateMutex();
 	dataMutex   = xSemaphoreCreateMutex();
 	mqttMutex   = xSemaphoreCreateMutex();
+	modbusMutex = xSemaphoreCreateMutex();
 	sdMutex     = xSemaphoreCreateMutex();
 
 	// ===== KHỞI TẠO RTC DS1307 =====
@@ -1498,11 +1555,9 @@ void setup()
 		LOG("SD", "Không tìm thấy SD card!");
 	}
 
-	pinMode(RELAY_ALARM, OUTPUT);
 	pinMode(MAX485_DE, OUTPUT);
 	pinMode(MODEM_RST, OUTPUT);
 
-	digitalWrite(RELAY_ALARM, HIGH);
 	mqtt.setBufferSize(4096);
 	mqtt.setKeepAlive(120);
 	mqtt.setSocketTimeout(30);
@@ -1536,7 +1591,6 @@ void setup()
 	xTaskCreatePinnedToCore(taskModbus,  "Modbus", 4096, NULL, 2, NULL, 1);
 	xTaskCreatePinnedToCore(taskAlarm,   "Alarm",  2048, NULL, 2, NULL, 1);
 
-	// Dùng HTTPS với CA cert của GitHub
 	// xTaskCreatePinnedToCore(taskOTA_HTTP,  "OTA", 8192, NULL, 1, NULL, 0);
 	xTaskCreatePinnedToCore(taskOTA_HTTPS, "OTA", 12288, NULL, 1, NULL, 0);
 
