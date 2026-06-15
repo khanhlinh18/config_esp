@@ -1,5 +1,5 @@
 #define TINY_GSM_MODEM_SIM7600
-#define FW_VERSION "1.0.0"   // <-- Tăng lên mỗi lần build firmware mới
+#define FW_VERSION "1.0.1"   // <-- Tăng lên mỗi lần build firmware mới
 
 // ================== OTA CONFIG ==================
 #define OTA_VERSION_URL_HTTP  "http://your-server.com/ota/version.json"
@@ -1295,7 +1295,6 @@ void taskOTA_HTTP(void *pvParameters)
         sdLog("INFO", "OTA", String("Updating to v") + latestVersion);
 
         WiFiClient otaClient;
-        httpUpdate.setLedPin(LED_AP, LOW);
         httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); // Cần thiết cho GitHub redirect
 
         // Callback khi update xong → tự reboot
@@ -1357,6 +1356,7 @@ void taskOTA_HTTPS(void *pvParameters)
 
         WiFiClientSecure versionClient;
         versionClient.setInsecure();
+        // versionClient.setCACert(OTA_CA_CERT);
 
         HTTPClient https;
         https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -1398,8 +1398,8 @@ void taskOTA_HTTPS(void *pvParameters)
         sdLog("INFO", "OTA", String("Updating to v") + latestVersion);
 
         WiFiClientSecure otaClient;
-        otaClient.setInsecure(); 
-        httpUpdate.setLedPin(LED_AP, LOW);
+        otaClient.setInsecure();
+        // otaClient.setCACert(OTA_CA_CERT); 
         httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
         httpUpdate.onProgress([](int cur, int total){
