@@ -34,6 +34,17 @@ void requestWiFiConnect() {
     WiFi.begin(conf_ssid.c_str(), conf_pass.c_str());
 }
 
+// ================== INTERNET CHECK ==================
+bool isInternetReachable() {
+    Serial.println("[NET] Đang kiểm tra internet (8.8.8.8:53)...");
+    WiFiClient testClient;
+    testClient.setTimeout(3000);
+    bool ok = testClient.connect("8.8.8.8", 53);
+    testClient.stop();
+    Serial.printf("[NET] Internet check: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // ================== MODEM ==================
 void resetModem() {
     pinMode(MODEM_RST, OUTPUT);
@@ -152,9 +163,54 @@ void taskNetwork(void* pvParameters) {
             if (!prev_wifi_ok) {
                 LOG("NET", "WiFi connected: %s IP:%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
                 wifi_start_time = millis();
+                // Kiểm tra internet ngay khi vừa connect WiFi
+                if (!isInternetReachable()) {
+                    LOG("NET", "WiFi có IP nhưng KHÔNG có internet → chuyển 4G");
+                    sdLog("WARN", "NET", "WiFi no internet, switching to GSM");
+                    prev_wifi_ok = false;
+                    WiFi.disconnect(); WiFi.mode(WIFI_OFF);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    gsm_ok = connectGSM();
+                    if (gsm_ok) {
+                        is_modem_sleeping = false;
+                        network_ok = true;
+                        mqtt.setClient(gsmClient);
+                        last_mqtt_retry = 0;
+                        global_gsm_ip = modem.localIP().toString();
+                        LOG("NET", "GSM connected (fallback), IP: %s", global_gsm_ip.c_str());
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
             }
             prev_wifi_ok = true;
             network_ok   = true;
+
+            // Định kỳ kiểm tra internet vẫn còn thông
+            static uint32_t last_inet_check = 0;
+            if (millis() - last_inet_check > 30000) {
+                last_inet_check = millis();
+                if (!isInternetReachable()) {
+                    LOG("NET", "WiFi mất internet → chuyển ngay sang 4G");
+                    sdLog("WARN", "NET", "WiFi lost internet, switching to GSM");
+                    prev_wifi_ok = false;
+                    network_ok   = false;
+                    WiFi.disconnect(); WiFi.mode(WIFI_OFF);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    gsm_ok = connectGSM();
+                    if (gsm_ok) {
+                        is_modem_sleeping = false;
+                        network_ok = true;
+                        mqtt.setClient(gsmClient);
+                        last_mqtt_retry = 0;
+                        global_gsm_ip = modem.localIP().toString();
+                        LOG("NET", "GSM connected (fallback), IP: %s", global_gsm_ip.c_str());
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
+            }
+
             if (!is_modem_sleeping) {
                 LOG("NET", "Đã có WiFi, tắt SIM tiết kiệm điện");
                 modem.sendAT("+CPOWD=1");

@@ -264,19 +264,8 @@ void startAP() {
 }
 
 void taskWebServer(void* pvParameters) {
+    // Đăng ký tất cả routes trước
     setupAPIEndpoints();
-    if (setup_mode) {
-        startAP();
-        LOG("WEB", "Đang chạy chế độ Setup (AP)");
-    } else {
-        uint32_t wait_start = millis();
-        while (WiFi.status() != WL_CONNECTED && !gsm_ok) {
-            if (millis() - wait_start > 30000) break;
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-        LOG("WEB", "Đang chạy chế độ Runtime. IP: %s",
-            WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : global_gsm_ip.c_str());
-    }
 
     server.on("/", HTTP_GET, []() {
         if (setup_mode) { server.send(200, "text/html", htmlForm); }
@@ -294,11 +283,17 @@ void taskWebServer(void* pvParameters) {
         else redirectToLogin();
     });
 
+    // Bật AP nếu setup mode
+    if (setup_mode) startAP();
+
+    // begin() ngay lập tức, không chờ mạng
     server.begin();
+    LOG("WEB", "Web server started");
+
     while (1) {
         if (setup_mode) dnsServer.processNextRequest();
         server.handleClient();
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 

@@ -41,6 +41,7 @@ extern SemaphoreHandle_t mqttMutex;
 extern RTC_DS1307        rtc;
 
 // ================== DECLARATIONS ==================
+bool isInternetReachable();
 void syncNTP();
 void requestWiFiConnect();
 void resetModem();
